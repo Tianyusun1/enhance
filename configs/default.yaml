@@ -1,0 +1,77 @@
+# File: configs/default.yaml (V7.0: Dynamic Gestalt & Attention Lock Optimized)
+
+model:
+  # BERT encoder
+  bert_path: "/home/610-sty/huggingface/bert-base-chinese"
+  hidden_size: 768
+  # Layout decoder
+  bb_size: 128             
+  decoder_layers: 6
+  decoder_heads: 8
+  dropout: 0.3
+  # Output
+  num_classes: 9
+  
+  # === CVAE Parameters ===
+  latent_dim: 64           
+
+  # === LOSS WEIGHTS (SUPERVISED STAGE) ===
+  reg_loss_weight: 1.0      
+  iou_loss_weight: 1.0      
+  area_loss_weight: 1.0     
+  
+  relation_loss_weight: 5.0 
+  overlap_loss_weight: 3.0   
+  size_loss_weight: 2.0     
+  
+  clustering_loss_weight: 1.0
+  # [重要] 提高一致性损失权重，因为它现在负责“文本流”与“8维布局流”的初步对齐
+  consistency_loss_weight: 2.0 
+
+  # [NEW] 态势能正则化损失 (防止 bx, by 预测过大导致 Mask 飞出画布)
+  gestalt_reg_loss_weight: 0.5
+
+  # Inference
+  max_elements: 30
+  
+  # Data paths
+  xlsx_path: "/home/610-sty/layout2paint/dataset/6800poems.xlsx"
+  images_dir: "/home/610-sty/layout2paint/dataset/6800"
+  labels_dir: "/home/610-sty/layout2paint/dataset/6800/JPEGImages-pre_new_txt"
+  max_layout_length: 30
+  max_text_length: 64
+
+training:
+  # === Stage 1: Supervised Pre-training ===
+  batch_size: 128         
+  epochs: 100             
+  learning_rate: 0.0001
+  warmup_steps: 1000      
+  
+  # Logging & Saving
+  save_every: 50          
+  output_dir: "./outputs/train_v7_gestal_rl" # 建议更换输出目录，避免覆盖
+  log_steps: 10
+  visualize_every: 5      
+
+  # === Stage 2: RL Fine-tuning Configuration ===
+  rl_epochs: 400          
+  rl_learning_rate: 2e-5  
+  
+  # RL Rewards Weights (核心创新点对齐)
+  reward_weights:
+    iou: 2.0              
+    relation: 5.0         
+    
+    # [NEW] 语义-注意力物理锁定奖励 (实现 100% 强绑定的关键)
+    # 权重设为 8.0，强制模型在 RL 阶段优先学会“把注意力放在对的框里”
+    alignment: 8.0        
+    
+    # [NEW] 艺术态势奖励 (鼓励山向上、水向横扩散)
+    gestalt_aesthetic: 1.5
+
+    dispersion: 0.5       
+    overlap: -1.0         # 加大重叠惩罚，配合势能场，防止意象挤在一起
+
+inference:
+  max_output_length: 30

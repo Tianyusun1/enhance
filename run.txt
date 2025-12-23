@@ -1,0 +1,35 @@
+# 目标：运行 200 个 Epoch，初始化模型权重。
+# 输出：模型检查点（例如，在 ./outputs/ 目录下）。
+python scripts/train.py
+
+
+# 目标：运行 200 个 Epoch，使用 SCST 优化布局质量。
+#
+# 【请替换 [SUPERVISED_CHECKPOINT_PATH] 为上一步保存的文件】
+# 示例路径：outputs/model_best_val_loss_1.234.pth
+python scripts/train.py \
+    --rl_tuning \
+    --checkpoint [SUPERVISED_CHECKPOINT_PATH]
+
+# 输出：最终的 RL 优化模型，例如 rl_best_reward.pth。
+
+#处理数据！
+python stage2_generation/scripts/prepare_data_taiyi.py
+
+# 目标：启动 ControlNet 训练，将布局掩码映射到图像空间。
+# 依赖：训练数据需在 ./sdxl_dataset_v1/ 目录下。
+bash stage2_generation/run_train.sh
+
+# 输出：训练好的 ControlNet 模型权重，位于 stage2_generation/taiyi_ink_controlnet_v1/ 目录下。
+
+
+# 目标：输入诗歌，输出最终图像。
+#
+# 【请替换所有 [PATH] 占位符为你实际的文件或目录路径】
+python integrated_inference.py \
+  --layout_ckpt "/home/610-sty/layout2paint3/outputs/train_v7_gestal_rl/rl_best_reward.pth" \
+  --taiyi_model_path "/home/610-sty/huggingface/Taiyi-Stable-Diffusion-1B-Chinese-v0.1" \
+  --lora_path "/home/610-sty/layout2paint3/outputs/taiyi_ink_controlnet_v2/unet_lora" \
+  --controlnet_seg_path "/home/610-sty/layout2paint3/outputs/taiyi_ink_controlnet_v2/controlnet_structure" \
+  --controlnet_t_path "/home/610-sty/layout2paint3/outputs/taiyi_ink_controlnet_v2/controlnet_style" \
+  --output_base "/home/610-sty/layout2paint3/outputs/infer_result"
