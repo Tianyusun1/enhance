@@ -29,7 +29,6 @@ bash stage2_generation/run_train.sh
 python integrated_inference.py \
   --layout_ckpt "/home/610-sty/layout2paint3/outputs/train_v7_gestal_rl/rl_best_reward.pth" \
   --taiyi_model_path "/home/610-sty/huggingface/Taiyi-Stable-Diffusion-1B-Chinese-v0.1" \
-  --lora_path "/home/610-sty/layout2paint3/outputs/taiyi_ink_controlnet_v2/unet_lora" \
-  --controlnet_seg_path "/home/610-sty/layout2paint3/outputs/taiyi_ink_controlnet_v2/controlnet_structure" \
-  --controlnet_t_path "/home/610-sty/layout2paint3/outputs/taiyi_ink_controlnet_v2/controlnet_style" \
+  --lora_path "/home/610-sty/layout2paint3/outputs/taiyi_ink_controlnet_v2/checkpoint-30000/unet_lora" \
+  --controlnet_seg_path "/home/610-sty/layout2paint3/outputs/taiyi_ink_controlnet_v2/checkpoint-30000/controlnet_structure" \
   --output_base "/home/610-sty/layout2paint3/outputs/infer_result"

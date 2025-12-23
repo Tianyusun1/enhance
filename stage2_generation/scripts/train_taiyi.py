@@ -1,4 +1,4 @@
-# File: stage2_generation/scripts/train_taiyi.py (V8.6: Single-Stream + Textured Mask)
+# File: stage2_generation/scripts/train_taiyi.py (V8.7: Double Dropout + Strong Style LoRA)
 
 import argparse
 import logging
@@ -87,7 +87,10 @@ def main():
     parser.add_argument("--mixed_precision", type=str, default="fp16") 
     parser.add_argument("--checkpointing_steps", type=int, default=2000)
     parser.add_argument("--lambda_struct", type=float, default=0.1, help="结构对齐损失权重")
-    parser.add_argument("--lora_rank", type=int, default=32, help="LoRA的秩")
+    
+    # [ENHANCE] 提升 LoRA 容量与强度
+    parser.add_argument("--lora_rank", type=int, default=64, help="LoRA的秩 (V8.7 提升至 64)")
+    parser.add_argument("--lora_alpha_ratio", type=float, default=2.0, help="LoRA Alpha/Rank 比例，默认 2.0 以增强风格")
     
     # [NEW] V8.6 智能冻结开关 (默认开启)
     parser.add_argument("--smart_freeze", action="store_true", default=True, help="开启智能冻结：只训练输入/输出层")
@@ -112,7 +115,7 @@ def main():
         file_handler = logging.FileHandler(log_file, mode='a')
         file_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
         logger.logger.addHandler(file_handler)
-        logger.info(f"✨ [V8.6 单流纹理版] 启动！")
+        logger.info(f"✨ [V8.7 双向 Dropout 增强版] 启动！")
         logger.info(f"📝 日志文件: {log_file}")
         logger.info(f"📈 实时曲线: {os.path.join(args.output_dir, 'loss_curve.png')}")
 
@@ -122,7 +125,7 @@ def main():
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
 
-    # [CHANGE] 初始化单流 ControlNet (不再有 controlnet_t)
+    # [CHANGE] 初始化单流 ControlNet
     if accelerator.is_main_process:
         print("正在初始化单流 ControlNet (Structure Stream)...")
     controlnet = ControlNetModel.from_unet(unet)
@@ -132,23 +135,24 @@ def main():
     text_encoder.requires_grad_(False)
     unet.requires_grad_(False) 
     
+    # [ENHANCE] 更强的 LoRA 配置
+    lora_alpha = args.lora_rank * args.lora_alpha_ratio
     unet_lora_config = LoraConfig(
         r=args.lora_rank,
-        lora_alpha=args.lora_rank,
+        lora_alpha=lora_alpha, # 强风格绑定
         init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0", "add_k_proj", "add_v_proj"],
     )
     unet = get_peft_model(unet, unet_lora_config)
     
     if accelerator.is_main_process:
-        print("✅ LoRA 注入成功 (负责水墨风格学习)")
+        print(f"✅ LoRA 注入成功 (Rank={args.lora_rank}, Alpha={lora_alpha}) - 强力模式")
         unet.print_trainable_parameters()
 
     # 显存优化
     try:
         unet.enable_xformers_memory_efficient_attention()
         controlnet.enable_xformers_memory_efficient_attention()
-        # [方案一] 默认开启 Gradient Checkpointing 省显存
         controlnet.enable_gradient_checkpointing()
         unet.enable_gradient_checkpointing()
     except Exception:
@@ -238,6 +242,12 @@ def main():
     vae.to(device, dtype=torch.float16)
     text_encoder.to(device, dtype=torch.float16)
 
+    # [ENHANCE] 预计算空文本 ID (用于 Prompt Dropout)
+    # 这样在训练循环里就不用重复 tokenize 了
+    empty_tokens = tokenizer("", max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt")
+    # 这里的 empty_input_ids 形状是 [1, seq_len]
+    empty_input_ids = empty_tokens.input_ids.to(device)
+
     # Loss 记录容器
     loss_history = {'steps': [], 'total': [], 'mse': [], 'struct': []}
 
@@ -261,7 +271,7 @@ def main():
     # 5. 训练循环
     global_step = 0
     if accelerator.is_main_process:
-        print(f"🚀 启动训练流程...")
+        print(f"🚀 启动训练流程 (双向 Dropout 策略生效)...")
         
     for epoch in range(args.num_train_epochs):
         controlnet.train()
@@ -278,16 +288,37 @@ def main():
                 scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
                 noisy_latents = scheduler.add_noise(latents, noise, timesteps)
                 
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
                 cond_image = batch["conditioning_pixel_values"].to(dtype=torch.float16)
-                
-                # [CHANGE] 单流 Dropout 策略
-                # 15% 概率完全丢弃 Condition，强迫 LoRA 学习 Text->Image 的映射
+                bsz = latents.shape[0]
+
+                # =========================================================
+                # [ENHANCE] 双向 Dropout 策略 (Double Dropout)
+                # 目标：强迫模型既能看懂诗，也能看懂画，且必须画水墨
+                # =========================================================
                 rand_dropout = random.random()
+                
+                # Case 1: 丢弃 Mask (15%) -> 强迫依赖诗句 (Text Internalization)
                 if rand_dropout < 0.15:
-                    cond_input = torch.zeros_like(cond_image) # 空 Mask
+                    cond_input = torch.zeros_like(cond_image)
+                    current_input_ids = batch["input_ids"]
+                    use_struct_loss = False
+                    
+                # Case 2: 丢弃 Text (15%) -> 强迫依赖 Mask (Style/Texture Locking)
+                # 即使没有诗句，看到这个枯笔 Mask 也必须画水墨
+                elif rand_dropout < 0.30:
+                    cond_input = cond_image
+                    # 扩展空文本 ID 到当前 batch size
+                    current_input_ids = empty_input_ids.repeat(bsz, 1)
+                    use_struct_loss = True
+                    
+                # Case 3: 正常训练 (70%) -> 对齐文本与画面
                 else:
-                    cond_input = cond_image # 正常纹理 Mask
+                    cond_input = cond_image
+                    current_input_ids = batch["input_ids"]
+                    use_struct_loss = True
+                
+                # 获取 Text Embedding
+                encoder_hidden_states = text_encoder(current_input_ids)[0]
                 
                 # ControlNet 前向 (单流)
                 down_block_res_samples, mid_block_res_sample = controlnet(
@@ -311,10 +342,9 @@ def main():
                 loss_ddpm = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
                 
                 # 结构对齐损失 (Struct Loss)
-                # 强制 ControlNet 的 mid_block 特征与输入 Mask 空间对齐
-                # 只有在没 Dropout (有 Mask 输入) 时才计算
+                # 只有在 Mask 存在时 (Case 2 & 3) 才计算
                 loss_struct = torch.tensor(0.0).to(device)
-                if rand_dropout >= 0.15: 
+                if use_struct_loss: 
                     cond_resized = F.interpolate(cond_input, size=mid_block_res_sample.shape[-2:], mode="bilinear")
                     loss_struct = F.l1_loss(mid_block_res_sample.mean(dim=1, keepdim=True), cond_resized.mean(dim=1, keepdim=True))
                 
@@ -331,9 +361,7 @@ def main():
             if global_step % args.checkpointing_steps == 0 and accelerator.is_main_process:
                 ckpt_dir = Path(args.output_dir) / f"checkpoint-{global_step}"
                 os.makedirs(ckpt_dir, exist_ok=True)
-                # 只保存一个 ControlNet
                 accelerator.unwrap_model(controlnet).save_pretrained(ckpt_dir / "controlnet_structure") 
-                # 保存 LoRA
                 accelerator.unwrap_model(unet).save_pretrained(ckpt_dir / "unet_lora")
                 print(f"💾 Checkpoint saved at step {global_step}")
 
@@ -372,25 +400,24 @@ def main():
                         unwrapped_unet = accelerator.unwrap_model(unet)
                         val_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
                         
-                        # [CHANGE] Pipeline 只传一个 controlnet
                         pipe = StableDiffusionControlNetPipeline(
                             vae=vae, text_encoder=text_encoder, tokenizer=tokenizer,
                             unet=unwrapped_unet, 
-                            controlnet=unwrapped_net, # 单流
+                            controlnet=unwrapped_net,
                             scheduler=val_scheduler, safety_checker=None, feature_extractor=None
                         ).to(device)
                         
-                        # 随机取一个batch做测试
                         test_batch = next(iter(val_dataloader))
                         test_cond = test_batch["conditioning_pixel_values"][0:1].to(device=device, dtype=torch.float16)
                         
-                        # 保存输入Mask (Layout)
+                        # 保存输入Mask
                         layout_img_pil = transforms.ToPILImage()(test_cond.squeeze(0).cpu())
                         layout_img_pil.save(Path(args.output_dir) / f"layout_epoch_{epoch}_val.png")
 
-                        # 保存生成图 (Sample)
+                        # 保存生成图 - 使用验证Prompt
+                        # 注意：虽然训练时不加Prompt，但验证时可以给一个简单的提示看看效果
                         sample_out = pipe(
-                            prompt="中国水墨山水画", # 固定Prompt测试稳定性
+                            prompt="中国水墨山水画", 
                             image=test_cond, 
                             num_inference_steps=20,
                             guidance_scale=7.5
@@ -403,7 +430,6 @@ def main():
             print(f"验证采样失败: {e}")
 
     if accelerator.is_main_process:
-        # 保存最终模型
         save_path_c = Path(args.output_dir) / "controlnet_structure"
         os.makedirs(save_path_c, exist_ok=True)
         accelerator.unwrap_model(controlnet).save_pretrained(save_path_c)

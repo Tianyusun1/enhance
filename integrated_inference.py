@@ -1,4 +1,4 @@
-# File: integrated_inference.py (V7.2: 8-dim Gestalt Supported)
+# File: integrated_inference.py (V8.8: Single-Stream + Pure Prompt + LoRA Hard Binding)
 
 import os
 import torch
@@ -12,28 +12,33 @@ from diffusers import StableDiffusionControlNetPipeline, ControlNetModel, DDPMSc
 
 # 导入项目内部组件
 # 确保项目根目录在 PYTHONPATH 中，或者通过 sys.path.append 添加
-from models.poem2layout import Poem2LayoutGenerator
-from inference.greedy_decode import greedy_decode_poem_layout
-from stage2_generation.utils.ink_mask import InkWashMaskGenerator
-from data.visualize import draw_layout
+try:
+    from models.poem2layout import Poem2LayoutGenerator
+    from inference.greedy_decode import greedy_decode_poem_layout
+    from stage2_generation.utils.ink_mask import InkWashMaskGenerator
+    from data.visualize import draw_layout
+except ImportError as e:
+    print(f"Error importing modules: {e}")
+    print("Please ensure project root is in PYTHONPATH.")
+    exit(1)
 
 # =============================================================
 # 参数解析配置
 # =============================================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="Integrated Inference for Poem2Painting (V7.0)")
+    parser = argparse.ArgumentParser(description="Integrated Inference for Poem2Painting (V8.8 Single Stream)")
     
     # 模型路径参数
-    parser.add_argument("--layout_ckpt", type=str, required=True, help="Path to the trained Poem2Layout V7.0 checkpoint")
+    parser.add_argument("--layout_ckpt", type=str, required=True, help="Path to the trained Poem2Layout V8.0 checkpoint (RL Best)")
     parser.add_argument("--taiyi_model_path", type=str, default="Idea-CCNL/Taiyi-Stable-Diffusion-1B-Chinese-v0.1", help="Base Stable Diffusion model")
     
-    # ControlNet & LoRA 路径
-    parser.add_argument("--controlnet_seg_path", type=str, required=True, help="Path to Structure ControlNet")
-    parser.add_argument("--controlnet_t_path", type=str, required=True, help="Path to Style ControlNet")
-    parser.add_argument("--lora_path", type=str, required=True, help="Path to trained LoRA weights")
+    # [CHANGE] V8.8: 单流 ControlNet + LoRA
+    parser.add_argument("--controlnet_path", type=str, required=True, help="Path to Structure ControlNet")
+    # parser.add_argument("--controlnet_t_path", type=str, required=True, help="Removed in V8.8") 
+    parser.add_argument("--lora_path", type=str, required=True, help="Path to trained UNet LoRA weights (Strong Style Binding)")
     
     # 输出设置
-    parser.add_argument("--output_base", type=str, default="outputs/integrated_inference", help="Directory to save results")
+    parser.add_argument("--output_base", type=str, default="outputs/integrated_inference_v8", help="Directory to save results")
     
     return parser.parse_args()
 
@@ -43,9 +48,9 @@ def parse_args():
 class PoemInkAttentionProcessor:
     """
     底层架构创新：通过干预 Cross-Attention 层实现数学级语义绑定。
-    [V7.0 更新]：支持态势能参数偏移，使注意力跟随墨迹扩散方向。
+    [V8.0 更新]：支持态势能参数偏移，使注意力跟随墨迹扩散方向。
     """
-    def __init__(self, dynamic_layout, tokenizer, prompt, device, scale=7.0):
+    def __init__(self, dynamic_layout, tokenizer, prompt, device, scale=8.0):
         # dynamic_layout layout: numpy array or tensor [N, 9] 
         # (cls, cx, cy, w, h, bx, by, rot, flow)
         self.layout = dynamic_layout  
@@ -75,6 +80,7 @@ class PoemInkAttentionProcessor:
         attention_probs = attn.get_attention_scores(query, key, attention_mask)
 
         # === 执行态势锚定 (Gestalt Anchoring) ===
+        # 动态计算分辨率 (Adapt for different SD versions if needed)
         res = int(np.sqrt(sequence_length))
         h, w = res, res
         tokens = self.tokenizer.encode(self.prompt)
@@ -86,7 +92,6 @@ class PoemInkAttentionProcessor:
             if not keyword: continue
             
             # 提取参数
-            # cx, cy, w, h = item[1:5]
             cx, cy, bw, bh = item[1], item[2], item[3], item[4]
             
             # 提取态势偏移参数 (bx, by) -> item[5], item[6]
@@ -102,7 +107,7 @@ class PoemInkAttentionProcessor:
 
             # [架构创新点]：根据态势能计算非对称注意力 Mask
             # 相比普通方框，这里加入了 (bx, by) 的中心偏移
-            x_c, y_c = (cx + bx * 0.1) * w, (cy + by * 0.1) * h
+            x_c, y_c = (cx + bx * 0.15) * w, (cy + by * 0.15) * h # V8.0 系数 0.15
             x1, y1 = int(x_c - (bw/2)*w), int(y_c - (bh/2)*h)
             x2, y2 = int(x_c + (bw/2)*w), int(y_c + (bh/2)*h)
             
@@ -136,45 +141,64 @@ def main():
     print(f"Running Inference on: {device}")
     
     # 初始化模型配置
-    config_path = "configs/default.yaml"
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found at {config_path}")
-        
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
+    # 尝试在多个位置查找 config
+    config_candidates = ["configs/default.yaml", os.path.join(os.path.dirname(__file__), "configs/default.yaml")]
+    config_path = None
+    for p in config_candidates:
+        if os.path.exists(p):
+            config_path = p
+            break
+            
+    if not config_path:
+        # Fallback config if file not found
+        print("Warning: Config file not found, using internal defaults.")
+        config = {'model': {'bert_path': 'bert-base-chinese', 'num_classes': 9, 'hidden_size': 768, 'bb_size': 128, 'decoder_layers': 6, 'decoder_heads': 8, 'latent_dim': 64}}
+    else:
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
     
-    # 1. 加载 Layout Generator (V7.0)
+    # 1. 加载 Layout Generator (V8.0)
     print("Loading Poem2Layout Generator...")
     layout_model = Poem2LayoutGenerator(
-        bert_path=config['model']['bert_path'],
+        bert_path=config['model'].get('bert_path', args.taiyi_model_path), # Use taiyi path if bert path missing
         num_classes=config['model']['num_classes'],
         hidden_size=config['model']['hidden_size'],
         bb_size=config['model']['bb_size'],
         decoder_layers=config['model']['decoder_layers'],
         decoder_heads=config['model']['decoder_heads'],
-        latent_dim=config['model'].get('latent_dim', 64)
+        latent_dim=config['model'].get('latent_dim', 64),
+        gestalt_loss_weight=2.0 # V8.0 specific
     ).to(device).eval()
     
     # 加载权重
     ckpt = torch.load(args.layout_ckpt, map_location=device)
-    # 兼容处理：检查是否包含 'model_state_dict' 键
     state_dict = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
-    layout_model.load_state_dict(state_dict)
+    # 移除 module. 前缀
+    state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+    layout_model.load_state_dict(state_dict, strict=False)
     
-    # 2. 加载太乙管线 (Stable Diffusion + ControlNet)
-    print("Loading Taiyi Stable Diffusion & ControlNets...")
-    controlnet_seg = ControlNetModel.from_pretrained(args.controlnet_seg_path, torch_dtype=torch.float16)
-    controlnet_t = ControlNetModel.from_pretrained(args.controlnet_t_path, torch_dtype=torch.float16)
+    # 2. 加载太乙管线 (Stable Diffusion + Single ControlNet)
+    print("Loading Taiyi Stable Diffusion & Single ControlNet...")
+    
+    # [CHANGE] V8.8: 加载单流 ControlNet
+    controlnet = ControlNetModel.from_pretrained(args.controlnet_path, torch_dtype=torch.float16)
     
     pipe = StableDiffusionControlNetPipeline.from_pretrained(
         args.taiyi_model_path,
-        controlnet=[controlnet_seg, controlnet_t],
-        torch_dtype=torch.float16
+        controlnet=controlnet, # 单流
+        torch_dtype=torch.float16,
+        safety_checker=None
     ).to(device)
     
     # 加载 LoRA
     print(f"Loading LoRA weights from {args.lora_path}...")
-    pipe.load_lora_weights(args.lora_path)
+    try:
+        pipe.load_lora_weights(args.lora_path)
+        print("✅ LoRA loaded successfully (Hard Style Binding).")
+    except Exception as e:
+        print(f"⚠️ Failed to load LoRA: {e}")
+    
+    pipe.enable_model_cpu_offload()
     
     # 3. 初始化水墨 Mask 生成器
     ink_gen = InkWashMaskGenerator(width=512, height=512)
@@ -183,7 +207,8 @@ def main():
     POEMS_50 = [
         "大漠孤烟直，长河落日圆。", 
         "两个黄鹂鸣翠柳，一行白鹭上青天。",
-        "忽如一夜春风来，千树万树梨花开。"
+        "忽如一夜春风来，千树万树梨花开。",
+        "明月松间照，清泉石上流。"
     ] 
 
     print(f"Start Inference for {len(POEMS_50)} poems...")
@@ -196,28 +221,27 @@ def main():
         # ---------------------------------------------------------
         # Step 1. 生成 8 维动态布局 (Dynamic Layout Generation)
         # ---------------------------------------------------------
-        tokenizer = BertTokenizer.from_pretrained(config['model']['bert_path'])
+        # 这里的 tokenizer 最好与 layout model 一致，通常是 bert-base-chinese
+        tokenizer = BertTokenizer.from_pretrained("bert-base-chinese") 
         layout_list = greedy_decode_poem_layout(layout_model, tokenizer, poem, device=device)
         
         if not layout_list:
             print(f"Warning: No layout generated for poem: {poem}")
             continue
             
-        # [CRITICAL] 转换为 Numpy 数组，以便支持 slicing (layout[:, :5])
+        # [CRITICAL] 转换为 Numpy 数组
         # layout shape: [N, 9] -> (cls, cx, cy, w, h, bx, by, rot, flow)
         layout = np.array(layout_list)
 
         # ---------------------------------------------------------
         # Step 2. 可视化基础框
         # ---------------------------------------------------------
-        # 这里传入全量 layout，依赖 visualize.py 中的鲁棒解包 (只取前5维)
-        # 或者为了保险，显式切片: layout[:, :5]
         draw_layout(layout, f"Poem: {poem}", os.path.join(save_dir, "01_layout.png"))
 
         # ---------------------------------------------------------
         # Step 3. 转换为势能场 Mask (Ink Wash Potential Field)
         # ---------------------------------------------------------
-        # ink_gen 需要支持 8 维输入来绘制带有扩散趋势的 mask
+        # ink_gen V8.6 支持纹理生成
         mask_img = ink_gen.convert_boxes_to_mask(layout)
         mask_img.save(os.path.join(save_dir, "02_potential_field.png"))
 
@@ -229,23 +253,23 @@ def main():
             tokenizer=pipe.tokenizer, 
             prompt=poem, 
             device=device,
-            scale=8.0 # 强绑定系数
+            scale=8.0 # V8.0 强绑定系数
         )
         pipe.unet.set_attn_processor(attn_proc)
 
         # ---------------------------------------------------------
-        # Step 5. 双流协同生成 (Dual-Stream Generation)
+        # Step 5. 单流生成 (Single-Stream Generation)
         # ---------------------------------------------------------
-        # 提示词增强
-        full_prompt = f"{poem}，写意水墨画，中国画风格，杰作，留白"
-        neg_prompt = "低质量，模糊，色彩斑驳，边框，水印"
+        # [CHANGE] V8.8: 纯净 Prompt，不加后缀
+        full_prompt = poem 
+        neg_prompt = "低质量，模糊，色彩斑驳，边框，水印，文字，现代建筑，照片真实感，写实风格，彩色照片"
         
         final_image = pipe(
             prompt=full_prompt,
             negative_prompt=neg_prompt,
-            image=[mask_img, mask_img], # 双流控制：结构流 + 风格流
+            image=mask_img, # [CHANGE] 单张 Mask
             num_inference_steps=35,
-            controlnet_conditioning_scale=[1.2, 0.8], # 结构流略强于风格流
+            controlnet_conditioning_scale=1.0, # [CHANGE] 1.0 (因为 LoRA 已经很强了)
             guidance_scale=7.5
         ).images[0]
         

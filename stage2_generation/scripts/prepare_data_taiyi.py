@@ -61,7 +61,7 @@ def main():
     metadata_entries = []
     
     # 基础风格词
-    style_suffix = "，水墨画，中国画，写意，杰作，高分辨率"
+    style_suffix = ""
 
     print(f"开始处理数据，共 {len(df)} 条...")
     for idx, row in tqdm(df.iterrows(), total=len(df)):
@@ -118,7 +118,7 @@ def main():
             target_img.save(os.path.join(args.output_dir, "images", target_img_name))
 
             # 6. 构造中文 Prompt
-            chinese_prompt = f"{poem}{style_suffix}"
+            chinese_prompt = f"{poem}"
 
             metadata_entries.append({
                 "image": f"images/{target_img_name}",
