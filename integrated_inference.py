@@ -1,4 +1,4 @@
-# File: integrated_inference.py (V8.8: Deep Unfreeze Adaptation + Pure Prompt + Texture Control)
+# File: integrated_inference.py (V9.5: Gestalt Energy Field & Smooth Anchoring Edition)
 
 import os
 import torch
@@ -46,9 +46,9 @@ def parse_args():
 class PoemInkAttentionProcessor:
     """
     通过干预 Cross-Attention 层实现数学级语义绑定。
-    [V8.8 适配]：保持位置锚定，将渲染细节交给解冻后的解码器。
+    [V9.5 升级]：引入高斯能量场锚定，实现平滑的水墨晕染效果。
     """
-    def __init__(self, dynamic_layout, tokenizer, prompt, device, scale=8.0):
+    def __init__(self, dynamic_layout, tokenizer, prompt, device, scale=5.0):
         self.layout = dynamic_layout  
         self.tokenizer = tokenizer
         self.prompt = prompt
@@ -79,6 +79,13 @@ class PoemInkAttentionProcessor:
         h, w = res, res
         tokens = self.tokenizer.encode(self.prompt)
         
+        # 预先准备坐标网格，用于计算高斯衰减
+        yy, xx = torch.meshgrid(
+            torch.arange(h, device=self.device), 
+            torch.arange(w, device=self.device), 
+            indexing='ij'
+        )
+
         for item in self.layout:
             cls_id = int(item[0])
             keyword = self.class_to_keyword.get(cls_id, None)
@@ -92,20 +99,22 @@ class PoemInkAttentionProcessor:
             
             if not token_indices: continue
 
-            # 根据态势能计算非对称注意力 Mask
+            # 1. 计算态势中心 (考虑 0.15 的 Bias Shift 偏移)
             x_c, y_c = (cx + bx * 0.15) * w, (cy + by * 0.15) * h
-            x1, y1 = int(x_c - (bw/2)*w), int(y_c - (bh/2)*h)
-            x2, y2 = int(x_c + (bw/2)*w), int(y_c + (bh/2)*h)
             
-            x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+            # 2. 计算高斯标准差 (以物体归一化尺寸为基准，/4 确保场强集中在物体内部且边缘平滑)
+            sigma = ((bw * w + bh * h) / 4.0) + 1e-6
+            
+            # 3. 计算高斯能量场掩码
+            dist_sq = (xx - x_c)**2 + (yy - y_c)**2
+            gauss_mask = torch.exp(-dist_sq / (2 * sigma**2)) * self.scale
+            mask_flat = gauss_mask.flatten() # [H*W]
 
-            if x2 > x1 and y2 > y1:
-                for idx in token_indices:
-                    if idx >= attention_probs.shape[-1]: continue
-                    mask = torch.zeros((h, w), device=self.device)
-                    mask[y1:y2, x1:x2] = self.scale
-                    mask_flat = mask.flatten()
-                    attention_probs[:, :, idx] += mask_flat * attention_probs[:, :, idx]
+            # 4. 注入注意力概率矩阵
+            for idx in token_indices:
+                if idx >= attention_probs.shape[-1]: continue
+                # 采用累加注入，且权重随空间距离自然衰减
+                attention_probs[:, :, idx] += mask_flat * attention_probs[:, :, idx]
 
         hidden_states = torch.bmm(attention_probs, value)
         hidden_states = attn.batch_to_head_dim(hidden_states)
@@ -170,7 +179,7 @@ def main():
         "明月松间照，清泉石上流。"
     ] 
 
-    print(f"Starting Inference for V8.8...")
+    print(f"Starting Inference for V9.5 (Smooth Energy Field Enabled)...")
 
     for i, poem in enumerate(tqdm(POEMS_TEST)):
         poem_clean = poem[:12].replace("，", "_").replace("。", "").strip()
@@ -190,13 +199,13 @@ def main():
         mask_img = ink_gen.convert_boxes_to_mask(layout)
         mask_img.save(os.path.join(save_dir, "02_potential_field.png"))
 
-        # Step 4. 架构注入
+        # Step 4. 架构注入 (使用高斯软能量场，建议 scale 设定在 5.0 左右以平衡晕染与清晰度)
         attn_proc = PoemInkAttentionProcessor(
             dynamic_layout=layout, 
             tokenizer=pipe.tokenizer, 
             prompt=poem, 
             device=device,
-            scale=8.0
+            scale=5.0
         )
         pipe.unet.set_attn_processor(attn_proc)
 
