@@ -1,11 +1,11 @@
-# File: configs/default.yaml (V7.0: Dynamic Gestalt & Attention Lock Optimized)
+# File: configs/default.yaml (V11.0: Physico-Semantic & Risk-Seeking Optimized)
 
 model:
   # BERT encoder
   bert_path: "/home/610-sty/huggingface/bert-base-chinese"
   hidden_size: 768
   # Layout decoder
-  bb_size: 128             
+  bb_size: 128            
   decoder_layers: 6
   decoder_heads: 8
   dropout: 0.3
@@ -13,9 +13,10 @@ model:
   num_classes: 9
   
   # === CVAE Parameters ===
-  latent_dim: 64           
+  latent_dim: 64          
 
-  # === LOSS WEIGHTS (SUPERVISED STAGE) ===
+  # === LOSS WEIGHTS (SUPERVISED STAGE 1) ===
+  # 第一阶段预训练还是用保守的参数，打好基础
   reg_loss_weight: 1.0      
   iou_loss_weight: 1.0      
   area_loss_weight: 1.0     
@@ -25,10 +26,7 @@ model:
   size_loss_weight: 2.0     
   
   clustering_loss_weight: 1.0
-  # [重要] 提高一致性损失权重，因为它现在负责“文本流”与“8维布局流”的初步对齐
   consistency_loss_weight: 2.0 
-
-  # [NEW] 态势能正则化损失 (防止 bx, by 预测过大导致 Mask 飞出画布)
   gestalt_reg_loss_weight: 0.5
 
   # Inference
@@ -50,28 +48,31 @@ training:
   
   # Logging & Saving
   save_every: 50          
-  output_dir: "./outputs/train_v7_gestal_rl" # 建议更换输出目录，避免覆盖
+  output_dir: "./outputs/train_v11_bold_explore" # [建议] 改个新名字，方便区分
   log_steps: 10
   visualize_every: 5      
 
-  # === Stage 2: RL Fine-tuning Configuration ===
+  # === Stage 2: RL Fine-tuning Configuration (V11.0 核心) ===
   rl_epochs: 400          
-  rl_learning_rate: 2e-5  
   
-  # RL Rewards Weights (核心创新点对齐)
+  # [CRITICAL] 学习率必须调低！因为 V11 用了指数级激励，梯度很大。
+  rl_learning_rate: 2e-6  
+  
+  # RL Rewards Weights (匹配 V11.0 代码逻辑)
   reward_weights:
+    # 1. 基础一致性
     iou: 2.0              
-    relation: 5.0         
+    relation: 3.0  # 稍微加强关系约束       
     
-    # [NEW] 语义-注意力物理锁定奖励 (实现 100% 强绑定的关键)
-    # 权重设为 8.0，强制模型在 RL 阶段优先学会“把注意力放在对的框里”
-    alignment: 8.0        
+    # 2. 物理与语义锚点 (最重要)
+    physics: 4.0          # [NEW] 物理常识：山大鸟小 (V11核心)
+    alignment: 5.0        # [UP]  语义位置：跟着热力图走 (强引力)
+    heatmap_size: 1.0     # [NEW] 语义大小：热力图辅助微调
     
-    # [NEW] 艺术态势奖励 (鼓励山向上、水向横扩散)
-    gestalt_aesthetic: 1.5
-
-    dispersion: 0.5       
-    overlap: -1.0         # 加大重叠惩罚，配合势能场，防止意象挤在一起
+    # 3. 空间力场 (解决堆叠)
+    dispersion: 3.0       # [UP]  分散斥力：把物体炸开 (原0.5太小了)
+    overlap: -5.0         # [UP]  重叠惩罚：绝对禁止堆叠 (原-2.0太弱了)
+    boundary: -2.0        # [NEW] 边界惩罚：别飞出画布
 
 inference:
   max_output_length: 30

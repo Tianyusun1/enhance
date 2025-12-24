@@ -1,4 +1,4 @@
-# File: trainers/trainer.py (V8.0: Adapted for Visual Gestalt Supervision + Preserved Features)
+# File: trainers/trainer.py (V9.0: Full Integration for Heatmap-Aware Training)
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
@@ -95,7 +95,7 @@ class LayoutTrainer:
         self.val_balance_history = []
         self.val_clustering_history = []
         
-        # [NEW V8.0] 视觉态势损失历史 (新增)
+        # [NEW V8.0] 视觉态势损失历史
         self.val_gestalt_history = []
 
     def _get_lr_scheduler(self):
@@ -120,13 +120,8 @@ class LayoutTrainer:
         return LambdaLR(self.optimizer, lr_lambda)
 
     def _update_curriculum(self, epoch):
-        """
-        [V4.2] 课程学习策略更新：
-        1. 动态调整 Reconstruction Weights (Logic -> Realism)
-        2. 动态调整 KL Weight (KL Annealing)
-        """
-        
-        # --- 策略 A: 权重转移 (Rel: 5->1, Reg: 1->5, 在epoch 间线性过渡) ---
+        """课程学习策略更新。"""
+        # --- 策略 A: 权重转移 ---
         if epoch < 50:
             new_rel_weight = 5.0
             new_reg_weight = 1.0
@@ -142,7 +137,7 @@ class LayoutTrainer:
         if hasattr(self.model, 'reg_loss_weight'):
             self.model.reg_loss_weight = new_reg_weight
         
-        # --- 策略 B: KL Annealing (V5.2: Early Intervention) ---
+        # --- 策略 B: KL Annealing ---
         target_kl = 0.005 
         kl_transition_start = 5
         kl_transition_duration = 150 
@@ -163,9 +158,7 @@ class LayoutTrainer:
         else:
             cur_rel_w = 5.0; cur_reg_w = 1.0; cur_kl_w = 0.01 
 
-        # 初始化运行损失变量
         total_loss_val = 0.0
-        # 各分项损失累加器
         t_reg = t_iou = t_area = t_rel = t_over = t_size = 0.0
         t_align = t_bal = t_clus = t_cons = t_gest = 0.0
         t_kl = 0.0
@@ -180,8 +173,8 @@ class LayoutTrainer:
                     if isinstance(batch[k], torch.Tensor):
                         batch[k] = batch[k].to(self.device)
                 
-                # 2. 前向传播
-                mu, logvar, pred_boxes, decoder_output = self.model(
+                # 2. 前向传播 [V9.0 改动：接收 5 个返回值]
+                mu, logvar, pred_boxes, decoder_output, pred_heatmaps = self.model(
                     input_ids=batch['input_ids'], 
                     attention_mask=batch['attention_mask'], 
                     kg_class_ids=batch['kg_class_ids'], 
@@ -191,7 +184,7 @@ class LayoutTrainer:
                     target_boxes=batch['target_boxes']
                 )
                 
-                # 3. 计算损失 (V8.0 Updated Unpacking)
+                # 3. 计算损失
                 loss_tuple = self.model.get_loss(
                     pred_cls=None, pred_bbox_ids=None, pred_boxes=pred_boxes, 
                     pred_count=None, layout_seq=None, layout_mask=batch['loss_mask'], 
@@ -200,11 +193,10 @@ class LayoutTrainer:
                     kg_class_weights=batch.get('kg_class_weights'),
                     kg_class_ids=batch['kg_class_ids'], 
                     decoder_output=decoder_output,
-                    gestalt_mask=batch.get('gestalt_mask') # [NEW V8.0] 传入态势Mask，忽略无效提取
+                    gestalt_mask=batch.get('gestalt_mask')
                 )
                 
-                # [CRITICAL UPDATE V8.0] 解包 12 个返回值 (新增 consistency 和 gestalt)
-                # 必须与 poem2layout.py 的返回值完全对应
+                # [V9.0 同步解包 12 个损失项]
                 (loss_recons, l_rel, l_over, l_reg, l_iou, l_size, l_area, 
                  l_align, l_bal, l_clus, l_cons, l_gestalt) = loss_tuple
                 
@@ -229,19 +221,15 @@ class LayoutTrainer:
                 t_reg += l_reg.item(); t_iou += l_iou.item(); t_area += l_area.item()
                 t_rel += l_rel.item(); t_over += l_over.item(); t_size += l_size.item()
                 t_align += l_align.item(); t_bal += l_bal.item(); t_clus += l_clus.item()
-                t_cons += l_cons.item(); t_gest += l_gestalt.item() # [NEW] Accumulate Gestalt
+                t_cons += l_cons.item(); t_gest += l_gestalt.item()
                 t_kl += kl_val.item()
                 
                 if is_training and (step + 1) % self.log_steps == 0:
-                    current_lr = self.optimizer.param_groups[0]['lr']
                     print(f"Epoch [{epoch+1}][TRAIN] {step+1}/{data_len} | "
                           f"Tot:{final_loss.item():.3f} | Rel:{l_rel.item():.3f} | "
-                          f"Reg:{l_reg.item():.3f} | Cons:{l_cons.item():.3f} | "
-                          f"Gest:{l_gestalt.item():.3f} | KL:{kl_val.item():.3f}") # Print Gestalt
+                          f"Reg:{l_reg.item():.3f} | Gest:{l_gestalt.item():.3f} | KL:{kl_val.item():.3f}")
         
         n = len(data_loader) if len(data_loader) > 0 else 1
-        
-        # 返回 13 个平均值
         return (total_loss_val/n, t_rel/n, t_over/n, t_reg/n, t_iou/n, t_size/n, t_area/n, 
                 t_align/n, t_bal/n, t_clus/n, t_cons/n, t_gest/n, t_kl/n)
 
@@ -249,7 +237,6 @@ class LayoutTrainer:
         start_time = time.time()
         print("\n--- Starting Validation ---")
         
-        # [V8.0] Unpack 13 values
         avg_vals = self._run_epoch(self.val_loader, is_training=False, epoch=epoch)
         (avg_loss, avg_rel, avg_over, avg_reg, avg_iou, avg_size, avg_area, 
          avg_align, avg_bal, avg_clus, avg_cons, avg_gest, avg_kl) = avg_vals
@@ -268,7 +255,7 @@ class LayoutTrainer:
         self.val_alignment_history.append(avg_align) 
         self.val_balance_history.append(avg_bal)
         self.val_clustering_history.append(avg_clus)
-        self.val_gestalt_history.append(avg_gest) # [NEW] Record Gestalt
+        self.val_gestalt_history.append(avg_gest)
         self.val_kl_history.append(avg_kl)
         
         print(f"Val Avg: Total:{avg_loss:.4f} | Rel:{avg_rel:.3f} | Over:{avg_over:.3f} | "
@@ -279,7 +266,6 @@ class LayoutTrainer:
     def test(self):
         start_time = time.time()
         print("\n--- Starting Test Set Evaluation ---")
-        # [V8.0] Unpack 13 values (we only need the first one mostly)
         avg_vals = self._run_epoch(self.test_loader, is_training=False, epoch=999) 
         avg_loss = avg_vals[0]
         print(f"Test Avg Loss: {avg_loss:.4f}")
@@ -292,7 +278,6 @@ class LayoutTrainer:
         poem_text = self.example_poem['poem']
         print(f"Poem: {poem_text}")
         
-        # 尝试打印 KG 对象作为调试
         try:
             ds = self.train_loader.dataset
             if hasattr(ds, 'dataset'): ds = ds.dataset 
@@ -320,7 +305,6 @@ class LayoutTrainer:
         draw_layout(layout, f"PRED (CVAE) E{epoch+1}: {poem_text}", output_path)
         print(f"-> Generated layout saved to {output_path}")
 
-        # 真实布局可视化 (每 10 个可视化周期保存一次 GT)
         if epoch == 0 or (epoch + 1) % (self.visualize_every * 10) == 0:
             true_boxes = self.example_poem['boxes']
             true_layout_path = os.path.join(self.output_dir, f"layout_true_example.png")
@@ -335,7 +319,6 @@ class LayoutTrainer:
         if not self.train_loss_history: return
         epochs = range(1, len(self.train_loss_history) + 1)
         
-        # === 图 1: 重建损失 (Reconstruction Losses) ===
         plt.figure(figsize=(12, 8))
         plt.plot(epochs, self.train_loss_history, label='Train Total', color='blue', marker='o', alpha=0.6)
         plt.plot(epochs, self.val_loss_history, label='Val Total', color='red', marker='s', alpha=0.8)
@@ -344,12 +327,9 @@ class LayoutTrainer:
             plt.plot(epochs, self.val_relation_history, label='Val Rel', linestyle=':', alpha=0.7)
             plt.plot(epochs, self.val_overlap_history, label='Val Over', linestyle=':', alpha=0.7)
             plt.plot(epochs, self.val_reg_history, label='Val Reg', linestyle='--', alpha=0.5) 
-            plt.plot(epochs, self.val_alignment_history, label='Val Align', linestyle='-.', alpha=0.6)
-            plt.plot(epochs, self.val_clustering_history, label='Val Clus', linestyle='-.', alpha=0.6)
-            # [NEW] 绘制 Gestalt Loss - 黑色实线
             plt.plot(epochs, self.val_gestalt_history, label='Val Gestalt', color='black', linewidth=2, linestyle='-')
 
-        plt.title('Loss Trajectory (V8.0: +Visual Gestalt)', fontsize=14)
+        plt.title('Loss Trajectory (V9.0: Heatmap & Visual Gestalt)', fontsize=14)
         plt.xlabel('Epoch', fontsize=12)
         plt.ylabel('Loss Value', fontsize=12)
         plt.legend(loc='upper right', fontsize=10)
@@ -358,11 +338,9 @@ class LayoutTrainer:
         try:
             plt.savefig(self.plot_path_recons) 
             plt.close()
-            print(f"-> Reconstruction loss plot saved to {self.plot_path_recons}")
         except Exception as e:
             print(f"[Warning] Could not save Reconstruction loss plot: {e}")
 
-        # === 图 2: KL 散度 (KL Divergence) ===
         if len(self.val_kl_history) > 1:
             plt.figure(figsize=(10, 6))
             plt.plot(epochs, self.val_kl_history, label='Original KL Div', color='darkblue', marker='.', linestyle='-')
@@ -416,7 +394,6 @@ class LayoutTrainer:
 
             if avg_val_loss < best_val_loss:
                 print("-> New best validation loss achieved. Replacing previous best model.")
-                # 删除旧模型
                 if self.current_best_model_path and os.path.exists(self.current_best_model_path):
                     try: os.remove(self.current_best_model_path)
                     except: pass

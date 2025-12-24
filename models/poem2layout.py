@@ -1,25 +1,29 @@
-# models/poem2layout.py (V8.2: Dynamic Composition - Density Aware Size Priors)
+# models/poem2layout.py (V9.0: Heatmap Projection & Generation - Full Version)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BertModel
+try:
+    from torchvision.ops import complete_box_iou_loss
+except ImportError:
+    def complete_box_iou_loss(boxes1, boxes2, reduction='none'):
+        return F.smooth_l1_loss(boxes1, boxes2, reduction=reduction)
+
 from .decoder import LayoutDecoder
 
 # ==========================================
 # [V8.2] 定义类别“基准”面积先验 (Base Area Ratio)
-# 这里的数值代表“在多物体复杂构图下”该物体的标准占比
-# 代码会自动根据物体数量(N)进行动态放大
 # ==========================================
 CLASS_AREA_PRIORS = {
-    2: 0.30,   # Mountain (山): 基准 30%
-    3: 0.30,   # Water (水): 基准 30%
-    4: 0.06,   # People (人): 基准 6%
-    5: 0.15,   # Tree (树): 基准 15%
+    2: 0.30,   # Mountain (山)
+    3: 0.30,   # Water (水)
+    4: 0.06,   # People (人)
+    5: 0.15,   # Tree (树)
     6: 0.15,   # Building (建筑)
     7: 0.10,   # Bridge (桥)
-    8: 0.03,   # Flower (花): 基准 3%
-    9: 0.015,  # Bird (鸟): 基准 1.5% (单只时会自动放大到 6%+)
+    8: 0.03,   # Flower (花)
+    9: 0.015,  # Bird (鸟)
     10: 0.05   # Animal (动物)
 }
 
@@ -123,7 +127,7 @@ class Poem2LayoutGenerator(nn.Module):
                  balance_loss_weight: float = 0.5,
                  clustering_loss_weight: float = 1.0, 
                  consistency_loss_weight: float = 1.0, 
-                 gestalt_loss_weight: float = 2.0, # 像素级态势弱监督权重
+                 gestalt_loss_weight: float = 2.0, 
                  latent_dim: int = 32,               
                  **kwargs): 
         super(Poem2LayoutGenerator, self).__init__()
@@ -179,7 +183,7 @@ class Poem2LayoutGenerator(nn.Module):
         
         # 6. CVAE Components
         self.layout_encoder = LayoutTransformerEncoder(
-            input_dim=4, # Encoder 仍然只看坐标，Latent Space 聚焦于结构
+            input_dim=4,
             hidden_size=hidden_size,
             num_layers=2,
             nhead=4,
@@ -205,10 +209,10 @@ class Poem2LayoutGenerator(nn.Module):
             dropout=dropout
         )
 
-        # === 9. 双头预测系统 (Dual-Head Prediction) ===
+        # === 9. 双头预测系统 ===
         decoder_output_size = hidden_size + bb_size
         
-        # A. 基础坐标回归头 (BBox Head)
+        # A. 基础坐标回归头
         self.reg_head = nn.Sequential(
             nn.Linear(decoder_output_size, hidden_size),
             nn.ReLU(),
@@ -216,8 +220,7 @@ class Poem2LayoutGenerator(nn.Module):
             nn.Linear(hidden_size, 4)
         )
 
-        # B. 形态态势头 (Object Gestalt Head) - [Updated for V8.0 Pixel Learning]
-        # B1. 方向性特征 (Direction): [bias_x, bias_y, rotation] -> Tanh
+        # B. 形态态势头
         self.gestalt_dir_head = nn.Sequential(
             nn.Linear(decoder_output_size, hidden_size // 2),
             nn.ReLU(),
@@ -225,16 +228,23 @@ class Poem2LayoutGenerator(nn.Module):
             nn.Tanh() 
         )
 
-        # B2. 强度性特征 (Intensity): [flow] -> Sigmoid
         self.gestalt_flow_head = nn.Sequential(
             nn.Linear(decoder_output_size, hidden_size // 2),
             nn.ReLU(),
             nn.Linear(hidden_size // 2, 1),
-            nn.Sigmoid() 
+            nn.Tanh()
         )
         
         # 10. Consistency Projection
         self.consistency_proj = nn.Linear(bb_size, hidden_size)
+
+        # [NEW V9.0] 热力图投影头 (Heatmap Projection Head)
+        # 目的：从 Decoder 输出中恢复出 64x64 的空间热力图，用于 RL 对齐
+        self.heatmap_small_dim = 16
+        self.heatmap_head = nn.Sequential(
+            nn.Linear(decoder_output_size, self.heatmap_small_dim * self.heatmap_small_dim),
+            nn.ReLU(),
+        )
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -258,6 +268,23 @@ class Poem2LayoutGenerator(nn.Module):
         spatial_bias = spatial_bias.permute(0, 3, 1, 2).contiguous() 
         return spatial_bias
 
+    # [NEW V9.0] 生成热力图的辅助函数
+    def generate_heatmaps(self, decoder_output):
+        B, T, _ = decoder_output.shape
+        # 1. Project to small grid features: [B, T, 16*16]
+        flat_maps = self.heatmap_head(decoder_output)
+        
+        # 2. Reshape: [B*T, 1, 16, 16]
+        small_maps = flat_maps.view(B * T, 1, self.heatmap_small_dim, self.heatmap_small_dim)
+        
+        # 3. Upsample to 64x64: [B*T, 1, 64, 64]
+        # 使用 bilinear 插值获得平滑的热力图
+        large_maps = F.interpolate(small_maps, size=(64, 64), mode='bilinear', align_corners=False)
+        
+        # 4. Activate: [B, T, 64, 64]
+        heatmaps = torch.sigmoid(large_maps).view(B, T, 64, 64)
+        return heatmaps
+
     def forward(self, input_ids, attention_mask, kg_class_ids, padding_mask, 
                 kg_spatial_matrix=None, location_grids=None, target_boxes=None):
         
@@ -267,7 +294,6 @@ class Poem2LayoutGenerator(nn.Module):
         content_embed = self.cond_dropout(content_embed)
         
         if target_boxes is not None:
-            # 切片取前 4 维 (cx, cy, w, h)
             target_geom = target_boxes[..., :4]
             global_layout_feat = self.layout_encoder(target_geom, mask=padding_mask) 
             mu = self.mu_head(global_layout_feat)
@@ -281,7 +307,6 @@ class Poem2LayoutGenerator(nn.Module):
             
         z_feat = self.z_proj(z).unsqueeze(1) 
 
-        # === Disentangled Stream Construction ===
         layout_content = content_embed + z_feat 
         pos_feat = torch.zeros_like(content_embed)
         
@@ -299,8 +324,9 @@ class Poem2LayoutGenerator(nn.Module):
             row_idx = gather_ids.view(B, T, 1).expand(-1, -1, T)
             col_idx = gather_ids.view(B, 1, T).expand(-1, T, -1)
             seq_rel_ids = kg_spatial_matrix[b_idx, row_idx, col_idx]
+            
             learned_pos = self.gnn_prior(content_embed, seq_rel_ids)
-            pos_feat = pos_feat + learned_pos 
+            layout_content = layout_content + learned_pos 
 
         pos_feat = self.cond_dropout(pos_feat)
         B, T = kg_class_ids.shape
@@ -325,26 +351,30 @@ class Poem2LayoutGenerator(nn.Module):
 
         # === Outputs ===
         pred_boxes = torch.sigmoid(self.reg_head(decoder_output))
-        
-        # Dual-Head Gestalt Output
-        pred_dir = self.gestalt_dir_head(decoder_output)   # [B, T, 3]
-        pred_flow = self.gestalt_flow_head(decoder_output) # [B, T, 1]
-        pred_gestalt = torch.cat([pred_dir, pred_flow], dim=-1) # [B, T, 4]
+        pred_dir = self.gestalt_dir_head(decoder_output)   
+        pred_flow = self.gestalt_flow_head(decoder_output) 
+        pred_gestalt = torch.cat([pred_dir, pred_flow], dim=-1)
         
         dynamic_layout = torch.cat([pred_boxes, pred_gestalt], dim=-1)
         
-        return mu, logvar, dynamic_layout, decoder_output
+        # [NEW V9.0] 在 forward 中计算热力图并返回 (第5个参数)
+        pred_heatmaps = self.generate_heatmaps(decoder_output) # [B, T, 64, 64]
+        
+        return mu, logvar, dynamic_layout, decoder_output, pred_heatmaps
 
+    # [NEW V9.0] 适配 RL 训练，返回三元组
     def forward_rl(self, input_ids, attention_mask, kg_class_ids, padding_mask, 
                    kg_spatial_matrix=None, location_grids=None, target_boxes=None, 
                    sample=True):
-        _, _, dynamic_layout_mu, _ = self.forward(
+        # 接收 5 个返回值
+        _, _, dynamic_layout_mu, decoder_output, pred_heatmaps = self.forward(
             input_ids, attention_mask, kg_class_ids, padding_mask, 
             kg_spatial_matrix, location_grids, target_boxes=None
         )
         
         if not sample:
-            return dynamic_layout_mu, None
+            # 返回: 布局, 概率(None), 热力图
+            return dynamic_layout_mu, None, pred_heatmaps
 
         std = torch.ones_like(dynamic_layout_mu) * 0.1
         dist = torch.distributions.Normal(dynamic_layout_mu, std)
@@ -354,7 +384,7 @@ class Poem2LayoutGenerator(nn.Module):
         # RL 探索时的物理约束截断
         coords = torch.clamp(action_layout[..., :4], 0.0, 1.0)
         g_dir = torch.clamp(action_layout[..., 4:7], -1.0, 1.0)
-        g_flow = torch.clamp(action_layout[..., 7:8], 0.0, 1.0)
+        g_flow = torch.clamp(action_layout[..., 7:8], -1.0, 1.0) 
         
         final_action = torch.cat([coords, g_dir, g_flow], dim=-1)
         log_prob = dist.log_prob(final_action).sum(dim=-1)
@@ -362,16 +392,32 @@ class Poem2LayoutGenerator(nn.Module):
         if padding_mask is not None:
              log_prob = log_prob.masked_fill(padding_mask, 0.0)
 
-        return final_action, log_prob
+        # 返回: 布局, 概率, 热力图
+        return final_action, log_prob, pred_heatmaps
+
+    # [NEW V9.0] 辅助函数：根据 GT 生成高斯分布掩码，用于监督热力图
+    def _generate_gaussian_masks(self, boxes, grid_size=64):
+        B, T, _ = boxes.shape
+        device = boxes.device
+        y_grid, x_grid = torch.meshgrid(
+            torch.linspace(0, 1, grid_size, device=device), 
+            torch.linspace(0, 1, grid_size, device=device)
+        )
+        grid = torch.stack([x_grid, y_grid], dim=-1).view(1, 1, grid_size, grid_size, 2)
+        cx = boxes[..., 0].view(B, T, 1, 1)
+        cy = boxes[..., 1].view(B, T, 1, 1)
+        w  = boxes[..., 2].view(B, T, 1, 1)
+        h  = boxes[..., 3].view(B, T, 1, 1)
+        sigma_x = (w / 4.0).clamp(min=0.01)
+        sigma_y = (h / 4.0).clamp(min=0.01)
+        dist_sq = ((grid[..., 0] - cx)**2) / (2*sigma_x**2) + ((grid[..., 1] - cy)**2) / (2*sigma_y**2)
+        masks = torch.exp(-dist_sq)
+        return masks
 
     def get_loss(self, pred_cls, pred_bbox_ids, pred_boxes, pred_count, layout_seq, layout_mask, num_boxes, 
                  target_coords_gt=None, kg_spatial_matrix=None, kg_class_weights=None, kg_class_ids=None, 
                  decoder_output=None, gestalt_mask=None): 
-        """
-        [V8.2 Updated] 支持动态密度的类别面积先验
-        """
         loss_mask = layout_mask 
-        
         pred_coords = pred_boxes[..., :4]
         pred_gestalt = pred_boxes[..., 4:]
         
@@ -405,10 +451,7 @@ class Poem2LayoutGenerator(nn.Module):
         # 2. 高级布局损失
         loss_relation = self._compute_relation_loss(pred_coords, loss_mask, kg_spatial_matrix, kg_class_ids)
         loss_overlap = self._compute_overlap_loss(pred_coords, loss_mask, kg_spatial_matrix, kg_class_ids)
-        
-        # [CRITICAL FIX V8.2] 使用类别ID + 动态密度计算尺寸损失
         loss_size_prior = self._compute_size_loss(pred_coords, loss_mask, num_boxes, kg_class_ids=kg_class_ids)
-        
         loss_alignment = self._compute_alignment_loss(pred_coords, loss_mask)
         loss_balance = self._compute_balance_loss(pred_coords, loss_mask)
         loss_clustering = self._compute_clustering_loss(pred_coords, loss_mask, kg_class_ids)
@@ -419,30 +462,37 @@ class Poem2LayoutGenerator(nn.Module):
         if has_gestalt_gt:
             loss_g_vec = F.smooth_l1_loss(pred_gestalt, target_gestalt, reduction='none')
             loss_g_val = loss_g_vec.mean(dim=-1)
-            
             if gestalt_mask is not None:
-                if gestalt_mask.shape != loss_mask.shape:
-                      combined_mask = loss_mask
-                else:
-                    combined_mask = loss_mask * gestalt_mask
+                combined_mask = loss_mask * gestalt_mask if gestalt_mask.shape == loss_mask.shape else loss_mask
             else:
                 combined_mask = loss_mask
-                
             num_gestalt_valid = combined_mask.sum().clamp(min=1)
             loss_gestalt = (loss_g_val * combined_mask).sum() / num_gestalt_valid
 
+        # 4. [NEW V9.0] 热力图监督损失
+        loss_heatmap = torch.tensor(0.0, device=pred_boxes.device)
+        if decoder_output is not None:
+            # 重新生成 Heatmap 用于计算 Loss
+            pred_heatmaps = self.generate_heatmaps(decoder_output) 
+            # 生成 GT Gaussian Mask
+            gt_heatmaps = self._generate_gaussian_masks(target_boxes, grid_size=64)
+            # 计算 MSE Loss
+            hm_loss_map = F.mse_loss(pred_heatmaps, gt_heatmaps, reduction='none').mean(dim=[2, 3])
+            loss_heatmap = (hm_loss_map * loss_mask).sum() / num_valid
+
         total_loss = self.reg_loss_weight * loss_reg + \
-                     self.iou_loss_weight * loss_iou + \
-                     self.area_loss_weight * loss_area + \
-                     self.relation_loss_weight * loss_relation + \
-                     self.overlap_loss_weight * loss_overlap + \
-                     self.size_loss_weight * loss_size_prior + \
-                     self.alignment_loss_weight * loss_alignment + \
-                     self.balance_loss_weight * loss_balance + \
-                     self.clustering_loss_weight * loss_clustering + \
-                     self.consistency_loss_weight * loss_consistency + \
-                     self.gestalt_loss_weight * loss_gestalt 
-                     
+                      self.iou_loss_weight * loss_iou + \
+                      self.area_loss_weight * loss_area + \
+                      self.relation_loss_weight * loss_relation + \
+                      self.overlap_loss_weight * loss_overlap + \
+                      self.size_loss_weight * loss_size_prior + \
+                      self.alignment_loss_weight * loss_alignment + \
+                      self.balance_loss_weight * loss_balance + \
+                      self.clustering_loss_weight * loss_clustering + \
+                      self.consistency_loss_weight * loss_consistency + \
+                      self.gestalt_loss_weight * loss_gestalt + \
+                      5.0 * loss_heatmap # 强监督热力图
+                      
         return total_loss, loss_relation, loss_overlap, \
                loss_reg, loss_iou, loss_size_prior, loss_area, \
                loss_alignment, loss_balance, loss_clustering, loss_consistency, loss_gestalt
@@ -450,19 +500,14 @@ class Poem2LayoutGenerator(nn.Module):
     def _compute_consistency_loss(self, decoder_output, mask):
         if decoder_output is None:
             return torch.tensor(0.0, device=mask.device)
-        
         text_stream_feat = decoder_output[..., :self.hidden_size] 
         layout_stream_feat = decoder_output[..., self.hidden_size:] 
-        
         layout_projected = self.consistency_proj(layout_stream_feat) 
-        
         text_norm = F.normalize(text_stream_feat, p=2, dim=-1)
         layout_norm = F.normalize(layout_projected, p=2, dim=-1)
-        
         cosine_sim = (text_norm * layout_norm).sum(dim=-1) 
         loss = 1.0 - cosine_sim
         loss = (loss * mask).sum() / mask.sum().clamp(min=1)
-        
         return loss
 
     def _compute_iou_loss(self, pred, target, mask):
@@ -503,13 +548,10 @@ class Poem2LayoutGenerator(nn.Module):
                     idx_i = int(cid_i) - 2
                     idx_j = int(cid_j) - 2
                     if not (0 <= idx_i < 9 and 0 <= idx_j < 9): continue
-                    
                     rel = kg_spatial_matrix[b, idx_i, idx_j].item()
                     if rel == 0: continue
-                    
                     box_a = pred_boxes[b, i]
                     box_b = pred_boxes[b, j]
-                    
                     if rel in [1, 5]: # ABOVE / ON_TOP
                         dist = box_a[1] - box_b[1] + 0.05
                         if dist > 0:
@@ -530,8 +572,7 @@ class Poem2LayoutGenerator(nn.Module):
                         if l_inside > 0:
                             loss += l_inside
                             count += 1
-        if count > 0:
-            return loss / count
+        if count > 0: return loss / count
         return loss
 
     def _compute_overlap_loss(self, pred_boxes, mask, kg_spatial_matrix, kg_class_ids):
@@ -577,52 +618,29 @@ class Poem2LayoutGenerator(nn.Module):
                 bad_iou = iou_mat[target_mask]
                 loss += F.relu(bad_iou - 0.1).sum()
                 count += target_mask.sum()
-        if count > 0:
-            return loss / count
+        if count > 0: return loss / count
         return loss
 
-    # [CRITICAL FIX] 动态密度感知尺寸损失 (Dynamic Density-Aware Size Loss)
     def _compute_size_loss(self, pred_boxes, mask, num_boxes, kg_class_ids=None):
         pred_areas = pred_boxes[..., 2] * pred_boxes[..., 3] 
-        
-        # 1. 默认启发式基准 (0.5 / sqrt(N)) - 用于未知类别
         if num_boxes is None:
-            # mask: [B, T], N_per_sample: [B, 1]
             N_per_sample = mask.sum(dim=1, keepdim=True).clamp(min=1).float()
         else:
-            N_per_sample = num_boxes.float().clamp(min=1).unsqueeze(1) # [B, 1]
-            
+            N_per_sample = num_boxes.float().clamp(min=1).unsqueeze(1)
         base_expected_area = (0.5 / torch.sqrt(N_per_sample)).expand_as(pred_areas)
         target_areas = base_expected_area.clone()
 
-        # 2. [V8.2] 应用动态类别的面积先验
         if kg_class_ids is not None:
-            # A. 查表获取基准 (Base Prior)
             prior_lookup = torch.full((20,), -1.0, device=pred_boxes.device)
             for cid, area in CLASS_AREA_PRIORS.items():
                 prior_lookup[cid] = area
-            
-            # class_priors: [B, T]
             class_priors = prior_lookup[kg_class_ids]
-            
-            # B. 计算密度缩放因子 (Density Scaling Factor)
-            # N=1 -> x4.0 (主角特写)
-            # N=2 -> x2.5
-            # N<=5 -> x1.5
-            # N>5 -> x1.0 (保持基准，突出重点)
             density_scale = torch.ones_like(N_per_sample)
             density_scale[N_per_sample == 1] = 4.0
             density_scale[N_per_sample == 2] = 2.5
             density_scale[(N_per_sample > 2) & (N_per_sample <= 5)] = 1.5
-            
-            # C. 应用缩放
-            # broadcast scaling: [B, 1] -> [B, T]
             scaled_priors = class_priors * density_scale
-            
-            # D. 安全截断 (最大不超过 90%，留白)
             scaled_priors = torch.clamp(scaled_priors, max=0.90)
-            
-            # E. 融合 (只覆盖有定义先验的类别)
             has_prior_mask = (class_priors > 0).float()
             target_areas = has_prior_mask * scaled_priors + (1.0 - has_prior_mask) * target_areas
 
@@ -659,75 +677,52 @@ class Poem2LayoutGenerator(nn.Module):
 
             loss += min_dist_loss(x_vals) + min_dist_loss(y_vals)
             count += 1
-        if count > 0:
-            return loss / count
+        if count > 0: return loss / count
         return loss
 
     def _compute_balance_loss(self, pred_boxes, mask):
-        B, N, _ = pred_boxes.shape
         loss = torch.tensor(0.0, device=pred_boxes.device)
+        B, N, _ = pred_boxes.shape
         count = 0
         target_center = 0.5
         margin = 0.15 
-        
         for b in range(B):
             valid_indices = torch.nonzero(mask[b]).squeeze(1)
             if len(valid_indices) == 0: continue
-            
             boxes = pred_boxes[b, valid_indices]
             cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-            
             areas = w * h
             total_area = areas.sum().clamp(min=1e-6)
-            
             center_x = (cx * areas).sum() / total_area
             center_y = (cy * areas).sum() / total_area
-            
             dist_x = F.relu(torch.abs(center_x - target_center) - margin)
             dist_y = F.relu(torch.abs(center_y - target_center) - margin)
-            
             loss += (dist_x + dist_y)
             count += 1
-            
-        if count > 0:
-            return loss / count
+        if count > 0: return loss / count
         return loss
 
     def _compute_clustering_loss(self, pred_boxes, mask, kg_class_ids):
-        if kg_class_ids is None:
-            return torch.tensor(0.0, device=pred_boxes.device)
-            
+        if kg_class_ids is None: return torch.tensor(0.0, device=pred_boxes.device)
         loss = torch.tensor(0.0, device=pred_boxes.device)
         B, N, _ = pred_boxes.shape
         count = 0
         max_dist_threshold = 0.35 
-        
         for b in range(B):
             classes = kg_class_ids[b]
             valid_mask = mask[b]
             unique_classes = torch.unique(classes)
-            
             for cls_id in unique_classes:
                 if cls_id <= 2: continue 
-                
                 indices = torch.nonzero((classes == cls_id) & (valid_mask > 0)).squeeze(1)
-                
                 if len(indices) < 2: continue 
-                
                 for i in range(len(indices)):
                     for j in range(i + 1, len(indices)):
-                        idx1 = indices[i]
-                        idx2 = indices[j]
-                        
-                        box1 = pred_boxes[b, idx1] 
-                        box2 = pred_boxes[b, idx2]
-                        
+                        idx1 = indices[i]; idx2 = indices[j]
+                        box1 = pred_boxes[b, idx1]; box2 = pred_boxes[b, idx2]
                         dist = torch.sqrt((box1[0] - box2[0])**2 + (box1[1] - box2[1])**2)
-                        
                         if dist > max_dist_threshold:
                             loss += (dist - max_dist_threshold)
                             count += 1
-                            
-        if count > 0:
-            return loss / count
+        if count > 0: return loss / count
         return loss

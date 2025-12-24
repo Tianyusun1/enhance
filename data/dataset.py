@@ -1,4 +1,4 @@
-# File: data/dataset.py (V8.1: Pixel-Level Gestalt Supervision)
+# File: data/dataset.py (V8.5: Final Path Fix with Auto-Resolve)
 
 import os
 import torch
@@ -27,22 +27,21 @@ VALID_CLASS_IDS = set(CLASS_NAMES.keys())
 
 class VisualGestaltExtractor:
     """
-    [V8.1 升级版] 视觉态势提取器
-    利用水墨画的像素灰度（浓淡）直接计算物理势能，而非简单的二值化形状分析。
+    [V8.5 升级版] 视觉态势提取器
+    利用水墨画的像素灰度（浓淡）直接计算物理势能。
+    包含路径检查，防止因找不到图片导致训练崩溃。
     """
     def extract(self, image_path: str, box: List[float]) -> Tuple[List[float], float]:
         """
         输入: 全图路径, 归一化 Box [cx, cy, w, h]
         输出: 
             1. 态势参数 [bias_x, bias_y, rotation, flow]
-               - bias_x, bias_y: [-1.0, 1.0] (重心偏移)
-               - rotation: [-1.0, 1.0] (对应 -90度 ~ 90度)
-               - flow: [0.0, 1.0] (墨韵/洇散度，归一化强度)
-            2. 有效性 (validity): 1.0 表示提取成功且有意义，0.0 表示提取失败(如空白区域)
+            2. 有效性 (validity): 1.0 表示提取成功，0.0 表示失败
         """
         try:
             # 1. 安全性检查
             if not os.path.exists(image_path):
+                # 路径不存在时返回无效，允许训练继续
                 return [0.0, 0.0, 0.0, 0.0], 0.0
             
             # 读取灰度图
@@ -70,21 +69,17 @@ class VisualGestaltExtractor:
             crop = img[y1:y2, x1:x2]
             
             # 3. 水墨预处理：反色 + 软性降噪
-            # 纸白(255) -> 0, 墨黑(0) -> 255。保留中间调以计算“软矩”
+            # 纸白(255) -> 0, 墨黑(0) -> 255
             ink_map = 255.0 - crop.astype(float)
             
-            # 底噪过滤：将非常淡的痕迹(如纸张纹理)置0，只保留有效笔触
-            # 阈值可微调，这里设为 30
+            # 底噪过滤
             ink_map[ink_map < 30] = 0 
             
             total_ink = np.sum(ink_map)
-            # 如果墨水量太少，说明只是框到了空白或极淡的背景
             if total_ink < 100: 
                 return [0.0, 0.0, 0.0, 0.0], 0.0
 
             # === A. 计算 Bias (重心偏移) & Rotation (主轴) ===
-            # 使用原始 ink_map 进行矩计算 (Weighted by ink density)
-            # 注意：cv2.moments 支持 float32 输入，binaryImage=False 表示计算灰度矩
             M = cv2.moments(ink_map.astype(np.float32), binaryImage=False)
             
             bias_x, bias_y = 0.0, 0.0
@@ -101,41 +96,43 @@ class VisualGestaltExtractor:
                 geo_cY = h_crop / 2.0
                 
                 # 归一化偏移 (-1.0 ~ 1.0)
-                # 分母加 epsilon 防止除零
                 bias_x = (cX - geo_cX) / (geo_cX + 1e-6)
                 bias_y = (cY - geo_cY) / (geo_cY + 1e-6)
                 bias_x = np.clip(bias_x, -1.0, 1.0)
                 bias_y = np.clip(bias_y, -1.0, 1.0)
                 
-                # 主轴角度 (Rotation)
+                # 主轴角度
                 mu20 = M["mu20"] / M["m00"]
                 mu02 = M["mu02"] / M["m00"]
                 mu11 = M["mu11"] / M["m00"]
                 
-                # 计算偏角 theta (-pi/2 ~ pi/2)
                 theta = 0.5 * np.arctan2(2 * mu11, mu20 - mu02)
-                # 归一化到 -1 ~ 1
-                rotation = theta / (np.pi / 2)
+                rotation = theta / (np.pi / 2) # 归一化到 -1 ~ 1
             
             # === B. 计算 Flow (洇散度/墨韵) ===
-            # 墨韵定义：密度高(墨重)但边缘梯度低(模糊) -> Flow大
-            
-            # 1. 平均墨密度 (0~1)
             h_crop, w_crop = ink_map.shape
             avg_density = total_ink / (w_crop * h_crop * 255.0)
             
-            # 2. 边缘强度 (梯度)
+            # 边缘强度 (梯度)
             sobelx = cv2.Sobel(crop, cv2.CV_64F, 1, 0, ksize=3)
             sobely = cv2.Sobel(crop, cv2.CV_64F, 0, 1, ksize=3)
             grad_mag = np.sqrt(sobelx**2 + sobely**2)
-            avg_grad = np.mean(grad_mag) / 255.0 # 归一化梯度
+            avg_grad = np.mean(grad_mag) / 255.0 
             
-            # 计算 Flow
-            # +0.01 防止除零。若梯度极小，flow 可能会很大，需要截断
             raw_flow = avg_density / (avg_grad + 0.01)
             
-            # 经验归一化：假设 raw_flow 一般在 0~3.0 左右，将其压缩到 0~1
-            flow = np.clip(raw_flow / 3.0, 0.0, 1.0)
+            # [核心逻辑] 建立从物理湿润度到 [-1, 1] 的映射
+            # Pivot (干湿分界线) = 0.6
+            pivot = 0.6 
+            
+            if raw_flow > pivot:
+                # 湿润区间 (Wet Mode): (0, 1]
+                flow = (raw_flow - pivot) / (3.0 - pivot + 1e-6)
+                flow = np.clip(flow, 0.01, 1.0)
+            else:
+                # 枯笔区间 (Dry Mode): [-1, 0)
+                flow = (raw_flow - pivot) / pivot
+                flow = np.clip(flow, -1.0, -0.01)
             
             return [float(bias_x), float(bias_y), float(rotation), float(flow)], 1.0
             
@@ -166,29 +163,52 @@ class PoegraphLayoutDataset(Dataset):
         
         self.location_gen = LocationSignalGenerator(grid_size=8)
         
-        # [NEW V8.1] 初始化视觉态势提取器
+        # 初始化视觉态势提取器
         self.gestalt_extractor = VisualGestaltExtractor()
         print("✅ Visual Gestalt Extractor (Pixel-Level Soft Moments) initialized.")
         
         # 加载 Excel
         df = pd.read_excel(xlsx_path)
         
-        # 解析数据集根目录
-        self.dataset_root = os.path.dirname(os.path.dirname(os.path.abspath(xlsx_path)))
+        # [关键路径修复]
+        # dataset_root 指向 .../dataset/
+        self.dataset_root = os.path.dirname(os.path.abspath(xlsx_path))
+        print(f"[Debug] Dataset Root set to: {self.dataset_root}")
         
         self.data = []
 
         print("Loading dataset index...")
+        path_error_count = 0
+        
         for _, row in df.iterrows():
             raw_img_path = str(row['image']).strip()
             poem = str(row['poem']).strip()
             
-            # 构造绝对路径
+            # [核心修复] 智能路径解析 logic
             if os.path.isabs(raw_img_path):
                 full_img_path = raw_img_path
             else:
-                full_img_path = os.path.join(self.dataset_root, raw_img_path)
+                # 策略 A: 直接拼接 (针对文件名已包含目录的情况)
+                path_a = os.path.join(self.dataset_root, raw_img_path)
+                
+                # 策略 B: 强制插入 '6800' 子目录 (针对文件名缺失目录的情况)
+                path_b = os.path.join(self.dataset_root, '6800', raw_img_path)
+                
+                # 自动选择存在的路径
+                if os.path.exists(path_a):
+                    full_img_path = path_a
+                elif os.path.exists(path_b):
+                    full_img_path = path_b
+                else:
+                    # 如果都找不到，默认使用 path_b，以便报错信息能指向 dataset/6800
+                    full_img_path = path_b
             
+            # 记录找不到图片的数量，用于调试
+            if not os.path.exists(full_img_path):
+                path_error_count += 1
+                if path_error_count <= 5: # 只打印前5个错误
+                    print(f"❌ [Path Error] Image not found.\n   Tried A: {path_a}\n   Tried B: {path_b}")
+
             img_stem = Path(full_img_path).stem
             label_path = self.labels_dir / f"{img_stem}.txt"
 
@@ -219,6 +239,9 @@ class PoegraphLayoutDataset(Dataset):
                 })
 
         print(f"✅ PoegraphLayoutDataset 加载完成，共 {len(self.data)} 个样本")
+        if path_error_count > 0:
+            print(f"⚠️ 警告: 共 {path_error_count} 张图片未找到。请检查文件名是否正确。")
+            
         self.tokenizer = BertTokenizer.from_pretrained(bert_model_path)
 
     def __len__(self):
@@ -282,7 +305,7 @@ class PoegraphLayoutDataset(Dataset):
         # 3. GT 对齐与 [NEW] 视觉特征提取
         target_boxes_8d = [] 
         loss_mask = []
-        gestalt_mask = [] # [NEW] 用于指示哪些样本的 Gestalt 是有效的
+        gestalt_mask = [] # 用于指示哪些样本的 Gestalt 是有效的
 
         gt_dict = {}
         for item in gt_boxes:
@@ -359,7 +382,7 @@ class PoegraphLayoutDataset(Dataset):
             'kg_class_weights': torch.tensor(kg_class_weights, dtype=torch.float32), 
             'target_boxes': torch.tensor(target_boxes_8d, dtype=torch.float32), 
             'loss_mask': torch.tensor(loss_mask, dtype=torch.float32),
-            'gestalt_mask': torch.tensor(gestalt_mask, dtype=torch.float32), # [NEW]
+            'gestalt_mask': torch.tensor(gestalt_mask, dtype=torch.float32), 
             'kg_spatial_matrix': kg_spatial_matrix,
             'kg_vector': kg_vector,
             'num_boxes': torch.tensor(len(gt_boxes), dtype=torch.long),

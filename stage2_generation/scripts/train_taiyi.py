@@ -1,4 +1,4 @@
-# File: stage2_generation/scripts/train_taiyi.py (V9.3: Final Stable Rank-32 Edition)
+# File: stage2_generation/scripts/train_taiyi.py (V9.4: Final Fixed Edition with Negative Prompt & Stronger Struct)
 
 import argparse
 import logging
@@ -87,8 +87,8 @@ def main():
     parser.add_argument("--mixed_precision", type=str, default="fp16") 
     parser.add_argument("--checkpointing_steps", type=int, default=2000)
     
-    # [STRATEGY] lambda_struct 设置为 0.05 以保证结构稳定性，防止杂乱
-    parser.add_argument("--lambda_struct", type=float, default=0.05, help="结构对齐损失权重")
+    # [STRATEGY] lambda_struct: 修改为 0.5，强制结构对齐，防止杂乱 [MODIFIED]
+    parser.add_argument("--lambda_struct", type=float, default=0.5, help="结构对齐损失权重")
     
     # [ADAPTED] 核心修改：Rank 32 保证不全黑，Alpha 32 保证稳定
     parser.add_argument("--lora_rank", type=int, default=32, help="LoRA的秩 (调整为更稳健的 32)")
@@ -117,7 +117,7 @@ def main():
         file_handler = logging.FileHandler(log_file, mode='a')
         file_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
         logger.logger.addHandler(file_handler)
-        logger.info(f"✨ [V9.3 最终稳定版] Rank-32 架构，保护原生清晰度，全功能开启！")
+        logger.info(f"✨ [V9.4 修复版] Rank-32 架构 | Struct权重: {args.lambda_struct} | 验证增强: 开启")
 
     # 1. 加载模型
     tokenizer = transformers.BertTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
@@ -340,8 +340,18 @@ def main():
                     mask_pil = transforms.ToPILImage()(test_cond[0].cpu())
                     mask_pil.save(Path(args.output_dir) / f"val_epoch_{epoch+1}_mask.png")
                     
-                    # 2. 生成样例 (采样步数设为稳健的 50 步)
-                    sample_out = pipe(prompt=test_prompt, image=test_cond, num_inference_steps=50, guidance_scale=7.5).images[0]
+                    # 2. 生成样例 (验证修复：加入 Negative Prompt) [MODIFIED]
+                    # 定义负向提示词，压制真实感和杂乱细节
+                    VALIDATION_NEG_PROMPT = "真实照片，摄影感，3D渲染，锐利边缘，现代感，鲜艳色彩，油画，水粉画，细节过度丰富，高对比度，写实主义，照片效果"
+
+                    sample_out = pipe(
+                        prompt=test_prompt, 
+                        negative_prompt=VALIDATION_NEG_PROMPT,  # <--- ✅ 关键修改
+                        image=test_cond, 
+                        num_inference_steps=50, 
+                        guidance_scale=7.5
+                    ).images[0]
+                    
                     sample_out.save(Path(args.output_dir) / f"val_epoch_{epoch+1}_sample.png")
                     
                     # 3. 记录日志
@@ -355,7 +365,7 @@ def main():
     if accelerator.is_main_process:
         accelerator.unwrap_model(controlnet).save_pretrained(Path(args.output_dir) / "controlnet_structure")
         accelerator.unwrap_model(unet).save_pretrained(Path(args.output_dir) / "unet_lora")
-        print(f"✅ V9.3 训练全流程完成。")
+        print(f"✅ V9.4 训练全流程完成。")
 
 if __name__ == "__main__":
     main()
