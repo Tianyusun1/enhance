@@ -26,9 +26,12 @@ bash stage2_generation/run_train.sh
 # 目标：输入诗歌，输出最终图像。
 #
 # 【请替换所有 [PATH] 占位符为你实际的文件或目录路径】
+# 确保在项目根目录下执行，并设置 PYTHONPATH
+export PYTHONPATH=$PYTHONPATH:$(pwd)
+
 python integrated_inference.py \
-  --layout_ckpt "/home/610-sty/layout2paint3/outputs/train_v7_gestal_rl/rl_best_reward.pth" \
+  --layout_ckpt "outputs/your_layout_train_dir/rl_best_reward.pth" \
   --taiyi_model_path "/home/610-sty/huggingface/Taiyi-Stable-Diffusion-1B-Chinese-v0.1" \
-  --lora_path "/home/610-sty/layout2paint3/outputs/taiyi_ink_controlnet_v2/checkpoint-30000/unet_lora" \
-  --controlnet_seg_path "/home/610-sty/layout2paint3/outputs/taiyi_ink_controlnet_v2/checkpoint-30000/controlnet_structure" \
-  --output_base "/home/610-sty/layout2paint3/outputs/infer_result"
+  --controlnet_path "/home/610-sty/layout2paint3/outputs/taiyi_shanshui_v8_8_deep_unfreeze/checkpoint-XXXX/controlnet_structure" \
+  --lora_path "/home/610-sty/layout2paint3/outputs/taiyi_shanshui_v8_8_deep_unfreeze/checkpoint-XXXX/unet_lora" \
+  --output_base "outputs/final_shanshui_results_v8_8"

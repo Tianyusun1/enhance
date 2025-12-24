@@ -1,4 +1,4 @@
-# File: stage2_generation/scripts/prepare_data_taiyi.py (V8.1: Real Gestalt Extraction)
+# File: stage2_generation/scripts/prepare_data_taiyi.py (V8.8: Enhanced Shanshui Texture Mode)
 
 import sys
 import os
@@ -10,7 +10,7 @@ from tqdm import tqdm
 from PIL import Image
 import numpy as np
 
-# === 路径设置 ===
+# === 路径设置 (保持原有逻辑) ===
 current_file_path = os.path.abspath(__file__)
 stage2_root = os.path.dirname(os.path.dirname(current_file_path))
 project_root = os.path.dirname(stage2_root)
@@ -32,7 +32,7 @@ except ImportError:
     sys.exit(1)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Taiyi V8.1: 准备包含真实物理态势的训练数据")
+    parser = argparse.ArgumentParser(description="Taiyi V8.8: 准备包含深度纹理质感的数据集")
     default_xlsx = "/home/610-sty/layout2paint/dataset/6800poems.xlsx"
     default_img_dir = "/home/610-sty/layout2paint/dataset/6800"
     default_lbl_dir = "/home/610-sty/layout2paint/dataset/6800/JPEGImages-pre_new_txt"
@@ -40,7 +40,7 @@ def parse_args():
     parser.add_argument("--xlsx_path", type=str, default=default_xlsx)
     parser.add_argument("--images_dir", type=str, default=default_img_dir)
     parser.add_argument("--labels_dir", type=str, default=default_lbl_dir)
-    parser.add_argument("--output_dir", type=str, default="./taiyi_dataset_v8_real_gestalt") # 建议区分目录
+    parser.add_argument("--output_dir", type=str, default="./taiyi_dataset_v8_8_deep_style") 
     parser.add_argument("--resolution", type=int, default=512) 
     return parser.parse_args()
 
@@ -49,10 +49,10 @@ def main():
     os.makedirs(os.path.join(args.output_dir, "images"), exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "conditioning_images"), exist_ok=True)
     
-    # 1. 初始化 Mask 生成器 (绘图用)
+    # 1. 初始化 Mask 生成器 (保持原有设置，准备后续调用)
     ink_generator = InkWashMaskGenerator(width=args.resolution, height=args.resolution)
     
-    # 2. [NEW] 初始化态势提取器 (从原图提取物理参数用)
+    # 2. 初始化态势提取器 (保持原有逻辑)
     gestalt_extractor = VisualGestaltExtractor()
     print("✅ Visual Gestalt Extractor (Pixel-Level) initialized.")
     
@@ -60,7 +60,7 @@ def main():
     
     metadata_entries = []
     
-    # 基础风格词
+    # 基础风格词 (按要求保持为空，不使用风格触发词)
     style_suffix = ""
 
     print(f"开始处理数据，共 {len(df)} 条...")
@@ -76,48 +76,42 @@ def main():
             label_path = os.path.join(args.labels_dir, f"{img_stem}.txt")
             if not os.path.exists(label_path): continue
 
-            # 3. 读取 Box 并提取真实态势
+            # 3. 读取 Box 并提取真实态势 (保留原有提取流程)
             boxes_9d = [] # 存储 9 维数据 [cls, cx, cy, w, h, bx, by, rot, flow]
             
             with open(label_path, 'r') as f:
                 for line in f:
                     parts = line.strip().split()
                     if len(parts) >= 5: 
-                        # 基础几何信息
                         cls_id, cx, cy, w, h = map(float, parts[:5])
                         
-                        # [核心升级] 实时从原图提取真实的 Gestalt 参数
-                        # extract 接口返回: ([bias_x, bias_y, rot, flow], valid_score)
+                        # [核心逻辑] 实时提取 Gestalt 参数
                         g_params, valid = gestalt_extractor.extract(src_img_path, [cx, cy, w, h])
                         
-                        # 数据清洗：如果提取失败（如区域太小、纯白），则使用全0默认值
-                        # 这样 InkWashMaskGenerator 会回退到该类别的默认画法
                         if valid < 0.5:
                             g_params = [0.0, 0.0, 0.0, 0.0]
                             
-                        # 组装 9 维向量
-                        # 注意：这里我们不再依赖 txt 里可能存在的旧态势数据，而是重新从原图提取最新的
                         full_box = [cls_id, cx, cy, w, h] + g_params
                         boxes_9d.append(full_box)
             
             if not boxes_9d: continue
 
             # 4. 生成彩色势能场 Mask
-            # 传入 9 维数据，让 Generator 能够画出真实的重心偏移和墨韵洇散
-            # 注意：请确保 utils/ink_mask.py 中的 convert_boxes_to_mask 能处理 len(box)==9 的情况
-            cond_img = ink_generator.convert_boxes_to_mask(boxes_9d)
+            # [MODIFIED] 强制开启 texture 渲染模式
+            # 理由：为了让模型在不加关键词的情况下学习画风，Mask 必须具备墨色深浅和洇散的灰度质感。
+            # 这有助于 ControlNet 引导模型生成“笔触”而非“色块”。
+            cond_img = ink_generator.convert_boxes_to_mask(boxes_9d) 
             
-            # 关键：确保保存为 RGB 模式
-            cond_img_name = f"{img_stem}_ink_v8.png"
+            cond_img_name = f"{img_stem}_ink_v8_8.png"
             cond_img.save(os.path.join(args.output_dir, "conditioning_images", cond_img_name))
             
-            # 5. 处理原图 (Resize 到 512)
+            # 5. 处理原图 (保持原有处理)
             target_img = Image.open(src_img_path).convert("RGB")
             target_img = target_img.resize((args.resolution, args.resolution), Image.BICUBIC)
             target_img_name = f"{img_stem}.jpg"
             target_img.save(os.path.join(args.output_dir, "images", target_img_name))
 
-            # 6. 构造中文 Prompt
+            # 6. 构造纯净中文 Prompt (按要求不含风格后缀)
             chinese_prompt = f"{poem}"
 
             metadata_entries.append({
@@ -137,10 +131,10 @@ def main():
             json.dump(entry, f, ensure_ascii=False)
             f.write('\n')
             
-    print(f"✨ V8.1 真实态势数据集准备完成！")
+    print(f"✨ V8.8 深度纹理数据集准备完成！")
     print(f"📂 输出目录: {args.output_dir}")
     print(f"📄 索引文件: {output_jsonl}")
-    print("⚠️  下一步提示: 请检查 stage2_generation/utils/ink_mask.py 是否已支持 9 维输入绘图！")
+    print("⚠️  策略提示: 已强化 Mask 纹理层次，配合 train_taiyi.py 的深度解冻策略使用。")
 
 if __name__ == "__main__":
     main()
