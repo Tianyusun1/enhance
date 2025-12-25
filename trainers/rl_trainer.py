@@ -1,4 +1,4 @@
-# File: trainers/rl_trainer.py (V11.3: Gravity & Balance Optimized)
+# File: trainers/rl_trainer.py (V11.6: Fix Dimension Bug & Gravity)
 
 import torch
 import torch.nn.functional as F
@@ -20,13 +20,14 @@ CLASS_SIZE_PRIORS = {
 
 class RLTrainer(LayoutTrainer):
     """
-    [V11.3 Final] "重力平衡" + "去角点效应" 修正版
+    [V11.6 Fixed] 修复 Tensor 维度崩溃 + 坚持 "顶部留白/物体沉底" 策略
     
-    针对 400 轮后出现的 "布局偏上" 和 "死板站位(左上右下)" 进行物理修正：
-    1. [新增] 全局重心奖励 (Global Balance)：强制画面重心下沉，解决下方空洞。
-    2. [新增] 水平向心力 (Centering)：对抗过强的斥力，防止物体被锁死在画布四角。
-    3. [微调] 稍微降低 Dispersion 权重 (10.0 -> 7.0)，给布局灵活性留出空间。
-    4. [保留] 超分热力图、重叠熔断、自动绘图等所有核心功能。
+    修正记录:
+    1. [CRITICAL FIX] 修复 train_rl_epoch 中的维度错误: [128, 7] * [128] -> 崩溃。
+       修正为先对 log_prob 求和得到 [128]，再与 Advantage 相乘。
+    2. [Deep Gravity] 既然你说 "留白应该在上边"，这意味着 "物体应该在下边"。
+       保持重心目标 Target Y = 0.75 (画布中下部)，权重 5.0，强力把物体往下拉。
+    3. [Relation Fix] 包含完整的 _calculate_relation_reward 函数。
     """
     def __init__(self, model, train_loader, val_loader, config, tokenizer, example_poem, test_loader):
         super().__init__(model, train_loader, val_loader, config, tokenizer, example_poem, test_loader)
@@ -36,32 +37,32 @@ class RLTrainer(LayoutTrainer):
         self.success_scale = 2.0
         self.failure_scale = 0.1
         
-        # --- 权重策略：引入重力，打破死板 ---
+        # --- 权重策略 ---
         self.w_iou = 2.0    
         self.w_rel = 4.0      
         self.w_physics = 6.0    
         self.w_align = 4.0      
         self.w_hm_size = 2.5    
         
-        # [调整] 斥力从 10.0 降为 7.0，防止把物体推死在角落
+        # 斥力与惩罚
         self.w_disp = 7.0      
         self.w_overlap = -15.0 
         self.w_bound = -3.0
         
-        # [新增] 重心与平衡权重
-        self.w_balance = 3.0   # 垂直重心：解决"偏上"
-        self.w_center = 1.5    # 水平向心：解决"贴边"
+        # [关键策略] 重力沉底，留白在顶
+        self.w_balance = 5.0   # 强力拉拽物体向下 (Target Y=0.75)
+        self.w_center = 1.5    # 保持水平居中倾向
 
         self.last_reward_stats = {}
         self.reward_history = []
         self.plot_path_reward = os.path.join(self.output_dir, "rl_reward_trajectory.png")
 
-        print(f"[RLTrainer V11.3] Gravity System Initialized.")
-        print(f" -> Balance(Vertical): {self.w_balance} | Center(Horizontal): {self.w_center}")
+        print(f"[RLTrainer V11.6] System Initialized.")
+        print(f" -> Gravity Target Y=0.75 (Objects Bottom, Space Top) | Weight: {self.w_balance}")
 
     def compute_reward(self, dynamic_layout, batch, attention_maps=None):
         """
-        计算奖励：集成物理、热力图、斥力以及新的重力平衡系统
+        计算奖励：集成物理、热力图、斥力以及重力平衡系统
         """
         B, T, _ = dynamic_layout.shape
         device = dynamic_layout.device
@@ -74,10 +75,10 @@ class RLTrainer(LayoutTrainer):
         
         obj_rewards = torch.zeros(B, T, device=device)
         
-        # 1. 物理大小约束
+        # 1. 物理大小
         r_physics = self._calculate_physics_size_reward(pred_boxes, kg_class_ids) * self.w_physics
 
-        # 2. 真值一致性
+        # 2. IoU
         r_iou = self._calculate_iou(pred_boxes, target_boxes) * loss_mask * self.w_iou
 
         # 3. 空间关系
@@ -85,7 +86,7 @@ class RLTrainer(LayoutTrainer):
         if kg_spatial_matrix is not None:
             r_rel = self._calculate_relation_reward(pred_boxes, kg_spatial_matrix, kg_class_ids) * self.w_rel
 
-        # 4. 超分热力图引导 (保留 256x256 逻辑)
+        # 4. 热力图对齐
         r_align = torch.zeros(B, T, device=device)
         r_hm_size = torch.zeros(B, T, device=device)
         if attention_maps is not None:
@@ -94,29 +95,24 @@ class RLTrainer(LayoutTrainer):
             r_align = self._calculate_attention_alignment(potential_field, pred_boxes) * self.w_align
             r_hm_size = self._calculate_heatmap_area_reward(potential_field, pred_boxes) * self.w_hm_size
 
-        # 5. 空间力场 (斥力 + 边界)
+        # 5. 分散与边界
         r_disp = self._calculate_dispersion_reward(pred_boxes, loss_mask) * self.w_disp
         r_bound = self._calculate_boundary_penalty(pred_boxes) * self.w_bound
         
-        # 6. [新增] 重力与平衡系统
-        # (A) 垂直重心奖励：把布局拉下来
+        # 6. [重力系统]
+        # 垂直重力：把物体拉到 Y=0.75 (底部)，从而在顶部留白
         r_balance = self._calculate_vertical_balance_reward(pred_boxes, loss_mask) * self.w_balance
-        # (B) 水平向心奖励：把物体从角落拉出来
+        # 水平居中：防止贴边
         r_center = self._calculate_horizontal_centering_reward(pred_boxes) * self.w_center
 
-        # 7. 重叠惩罚与熔断
+        # 7. 重叠惩罚
         overlap_penalty = self._calculate_overlap_penalty(pred_boxes)
         r_over = overlap_penalty * self.w_overlap 
         veto_factor = (1.0 - overlap_penalty * 5.0).clamp(min=0.0)
         
-        # --- 最终汇总 ---
-        # 物理、对齐、重力是基础分
+        # --- 汇总 ---
         obj_rewards += (r_physics + r_align + r_balance + r_center) 
-        
-        # 关系、分散等受到熔断限制
         obj_rewards += (r_iou + r_hm_size + r_rel + r_disp) * veto_factor
-        
-        # 惩罚项无条件生效
         obj_rewards += r_bound 
         obj_rewards += r_over 
 
@@ -124,7 +120,7 @@ class RLTrainer(LayoutTrainer):
             'Phy': r_physics.mean().item(),
             'Align': r_align.mean().item(),
             'Disp': r_disp.mean().item(),
-            'Bal': r_balance.mean().item(), # 监控重心
+            'Bal': r_balance.mean().item(), 
             'Over': r_over.mean().item(),
         }
 
@@ -160,7 +156,17 @@ class RLTrainer(LayoutTrainer):
             norm_adv = (raw_adv - raw_adv.mean()) / (std + 1e-8) if std > 1e-6 else raw_adv
             final_adv = norm_adv * torch.where(norm_adv > 0, self.success_scale, self.failure_scale)
             
-            rl_loss = -(s_out[1] * final_adv).mean()
+            # === [CRITICAL FIX] ===
+            # s_out[1] shape: [Batch, Time] (e.g., 128, 7)
+            # final_adv shape: [Batch] (e.g., 128)
+            # 必须先将 log_prob 在时间维度求和，得到整句话的 log_prob，再乘 advantage
+            
+            # 1. Sum log_probs over sequence (dim=1) -> [Batch]
+            seq_log_prob = s_out[1].sum(dim=1)
+            
+            # 2. Calculate Policy Gradient Loss -> [Batch] -> scalar
+            rl_loss = -(seq_log_prob * final_adv).mean()
+            # ======================
             
             # Auxiliary Loss
             if step % 5 == 0:
@@ -189,7 +195,6 @@ class RLTrainer(LayoutTrainer):
             steps += 1
             if (step + 1) % 10 == 0:
                 s = self.last_reward_stats
-                # 打印 Balance 指标
                 print(f"[Step {step+1}] R:{reward_sample.mean().item():.2f} | Phy:{s.get('Phy',0):.2f} | Bal:{s.get('Bal',0):.2f} | Over:{s.get('Over',0):.2f}")
 
         # Plotting
@@ -198,35 +203,68 @@ class RLTrainer(LayoutTrainer):
         self._plot_reward_history()
         return avg_reward
 
-    # ================= 新增：重力与平衡函数 =================
+    # ================= 辅助函数 =================
+    
+    def _calculate_relation_reward(self, pred_boxes, kg_spatial_matrix, kg_class_ids):
+        """计算空间关系奖励 (Above/Below/Inside)"""
+        B, T, _ = pred_boxes.shape
+        device = pred_boxes.device
+        rewards = torch.zeros(B, T, device=device)
+        
+        for b in range(B):
+            valid_indices = torch.nonzero(kg_class_ids[b] >= 2).squeeze(1)
+            if len(valid_indices) < 2: continue
+
+            for i in valid_indices:
+                for j in valid_indices:
+                    if i == j: continue
+                    cid_i = kg_class_ids[b, i].item(); cid_j = kg_class_ids[b, j].item()
+                    idx_i, idx_j = int(cid_i) - 2, int(cid_j) - 2
+                    if not (0 <= idx_i < 9 and 0 <= idx_j < 9): continue
+                    
+                    rel = kg_spatial_matrix[b, idx_i, idx_j].item()
+                    if rel == 0: continue 
+                    
+                    box_a = pred_boxes[b, i]; box_b = pred_boxes[b, j]
+                    current_reward = 0.0
+                    
+                    if rel in [1, 5]: # ABOVE: A.y < B.y
+                        diff = box_a[1] - box_b[1]
+                        if diff < 0: current_reward = 1.0
+                        else: current_reward = torch.exp(-3.0 * diff)
+                    elif rel == 2: # BELOW: A.y > B.y
+                        diff = box_b[1] - box_a[1]
+                        if diff < 0: current_reward = 1.0
+                        else: current_reward = torch.exp(-3.0 * diff)
+                    elif rel == 3: # INSIDE
+                        a_x1, a_y1 = box_a[0]-box_a[2]/2, box_a[1]-box_a[3]/2
+                        a_x2, a_y2 = box_a[0]+box_a[2]/2, box_a[1]+box_a[3]/2
+                        b_x1, b_y1 = box_b[0]-box_b[2]/2, box_b[1]-box_b[3]/2
+                        b_x2, b_y2 = box_b[0]+box_b[2]/2, box_b[1]+box_b[3]/2
+                        violation = F.relu(b_x1 - a_x1) + F.relu(a_x2 - b_x2) + F.relu(b_y1 - a_y1) + F.relu(a_y2 - b_y2)
+                        if violation < 1e-4: current_reward = 1.0
+                        else: current_reward = torch.exp(-5.0 * violation)
+                    
+                    rewards[b, i] += current_reward
+        return torch.clamp(rewards, max=1.0)
 
     def _calculate_vertical_balance_reward(self, pred_boxes, mask):
         """
-        [新增] 全局重心奖励：解决布局整体偏上的问题
-        计算所有有效框的 Y 中心均值，鼓励其接近 0.6 (中下部)，惩罚 < 0.4 (太高)
+        [Deep Gravity] 
+        目标重心设为 0.75 (3/4处，靠近底部)。
+        这样物体会沉底，留白自然就出现在顶部了。
         """
         cy = pred_boxes[..., 1]
-        # 使用 mask 计算有效物体的平均 Y
-        # 注意：需要防止除以 0，且只计算 mask=1 的物体
         weighted_sum_cy = (cy * mask).sum(dim=1)
         count = mask.sum(dim=1).clamp(min=1.0)
         mean_cy = weighted_sum_cy / count
-        
-        # 目标重心：0.6 (微微偏下)。如果重心太靠上(0.3)或太靠下(0.9)都会扣分
-        return torch.exp(-5.0 * (mean_cy.unsqueeze(1) - 0.6) ** 2)
+        # 惩罚系数 4.0，严厉打击任何飘在上面的布局
+        return torch.exp(-4.0 * (mean_cy.unsqueeze(1) - 0.75) ** 2)
 
     def _calculate_horizontal_centering_reward(self, pred_boxes):
-        """
-        [新增] 水平向心力：解决物体死贴左右边缘的问题
-        给一个微弱的力，让物体 X 轴倾向于靠近 0.5，打破角点最优解
-        """
         cx = pred_boxes[..., 0]
-        # 计算离中心的距离
         dist_to_center = torch.abs(cx - 0.5)
-        # 距离越近奖励越高，但不用太强，主要是为了打破对称僵局
         return torch.exp(-2.0 * dist_to_center ** 2)
-
-    # ================= 原有辅助函数 =================
 
     def _calculate_physics_size_reward(self, pred_boxes, kg_class_ids):
         B, T = pred_boxes.shape[:2]
@@ -260,12 +298,12 @@ class RLTrainer(LayoutTrainer):
         m1, m2 = mask.unsqueeze(1).bool(), mask.unsqueeze(2).bool()
         v_mask = m1 & m2 & (~torch.eye(T, device=pred_boxes.device).bool().unsqueeze(0))
         sum_dist = (dist_mat * v_mask.float()).sum(dim=2)
-        # 降权到 4.0，防止过度推离
         return torch.clamp((sum_dist / v_mask.float().sum(dim=2).clamp(min=1.0)) * 4.0, max=1.0)
 
     def _calculate_boundary_penalty(self, pred_boxes):
         cx, cy = pred_boxes[..., 0], pred_boxes[..., 1]
-        pen = F.relu(0.05 - cx) + F.relu(cx - 0.95) + F.relu(0.05 - cy) + F.relu(cy - 0.95)
+        # 放宽底部边界限制(0.98)，允许物体沉底
+        pen = F.relu(0.05 - cx) + F.relu(cx - 0.95) + F.relu(0.05 - cy) + F.relu(cy - 0.98)
         return torch.clamp(pen * 5.0, max=2.0)
     
     def _calculate_iou(self, pred, target):

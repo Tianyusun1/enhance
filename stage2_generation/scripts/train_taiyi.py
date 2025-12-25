@@ -1,4 +1,4 @@
-# File: stage2_generation/scripts/train_taiyi.py (V9.5: Gestalt Energy Field Alignment Edition)
+# File: stage2_generation/scripts/train_taiyi.py (V9.7: Validation Sampling Fix & Gestalt Energy)
 
 import argparse
 import logging
@@ -141,7 +141,7 @@ def main():
 
     if accelerator.is_main_process:
         logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
-        logger.info(f"🚀 V9.5 启动: 态势能量场对齐模式 | Energy权重: {args.lambda_energy}")
+        logger.info(f"🚀 V9.7 启动: 验证采样修复版 | 态势能量场对齐 | Energy权重: {args.lambda_energy}")
 
     # 1. 加载模型
     tokenizer = transformers.BertTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
@@ -273,8 +273,6 @@ def main():
                 encoder_hidden_states = text_encoder(current_ids)[0]
                 
                 # [V9.5 核心逻辑] 提取 Cross-Attention Map 进行能量场对齐
-                # 我们暂时通过 loss_energy 显式约束，因为训练时干预处理器会破坏梯度流
-                # 在 unet.forward 中，我们可以通过 hook 或计算模型输出后的相关性来优化
                 
                 down_res, mid_res = controlnet(noisy_latents, timesteps, encoder_hidden_states, cond_input, return_dict=False)
                 
@@ -284,22 +282,22 @@ def main():
                     mid_block_additional_residual=mid_res.to(dtype=torch.float16)
                 ).sample
 
-                # A. 基础去噪损失
+                # A. 基础去噪损失 (已经 Cast 成 float 计算)
                 loss_mse = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
                 
                 # B. 结构特征损失 (ControlNet 对齐)
+                # [FIX V9.6]: 强制转为 float() (FP32) 计算，避免 FP16 Backward Error
                 loss_struct = torch.tensor(0.0).to(device)
                 if rand_dropout >= 0.15:
                     cond_feat = F.interpolate(cond_input, size=mid_res.shape[-2:], mode="bilinear")
-                    loss_struct = F.l1_loss(mid_res.mean(dim=1, keepdim=True), cond_feat.mean(dim=1, keepdim=True))
+                    loss_struct = F.l1_loss(mid_res.float().mean(dim=1, keepdim=True), cond_feat.float().mean(dim=1, keepdim=True))
 
                 # C. [NEW] 能量场损失：确保 UNet 注意力分布与高斯场一致
-                # 我们使用 mid_res（侧路特征）与 batch["energy_masks"] 进行弱相关对齐
+                # [FIX V9.6]: 强制转为 float() (FP32) 计算
                 loss_energy = torch.tensor(0.0).to(device)
                 if args.lambda_energy > 0 and rand_dropout >= 0.15:
-                    # 简化版：侧路特征的高级激活区应覆盖高斯场中心
                     energy_gt = F.interpolate(batch["energy_masks"].sum(dim=1).view(-1, 1, 64, 64), size=mid_res.shape[-2:])
-                    loss_energy = F.mse_loss(mid_res.mean(dim=1, keepdim=True), energy_gt.to(dtype=torch.float16))
+                    loss_energy = F.mse_loss(mid_res.float().mean(dim=1, keepdim=True), energy_gt.float())
 
                 total_loss = loss_mse + args.lambda_struct * loss_struct + args.lambda_energy * loss_energy
                 
@@ -318,18 +316,20 @@ def main():
                 accelerator.unwrap_model(controlnet).save_pretrained(ckpt_dir / "controlnet_structure") 
                 accelerator.unwrap_model(unet).save_pretrained(ckpt_dir / "unet_lora")
 
-        # 验证采样逻辑 (完整保留)
+        # [V9.7 FIX] 验证采样逻辑：增加 autocast 以解决 FP32 UNet 与 FP16 VAE 的冲突
         if accelerator.is_main_process:
             controlnet.eval(); unet.eval()
             try:
-                with torch.no_grad():
+                # 使用 autocast 自动处理 float/half 类型匹配
+                with torch.no_grad(), torch.autocast("cuda"):
                     pipe = StableDiffusionControlNetPipeline(
                         vae=vae, text_encoder=text_encoder, tokenizer=tokenizer,
                         unet=accelerator.unwrap_model(unet), controlnet=accelerator.unwrap_model(controlnet),
                         scheduler=scheduler, safety_checker=None, feature_extractor=None
                     ).to(device)
                     val_neg = "真实照片，摄影感，3D渲染，锐利边缘，现代感，鲜艳色彩，油画，水粉画"
-                    test_batch = next(iter(train_dataloader)) # 简化验证
+                    test_batch = next(iter(train_dataloader)) 
+                    # image 输入保持 FP16 即可，autocast 会处理 ControlNet(FP32) 的输入
                     sample_img = pipe(prompt=test_batch["texts"][0], negative_prompt=val_neg, 
                                     image=test_batch["conditioning_pixel_values"][0:1].to(device, dtype=torch.float16)).images[0]
                     sample_img.save(Path(args.output_dir) / f"val_epoch_{epoch+1}.png")
@@ -339,7 +339,7 @@ def main():
     if accelerator.is_main_process:
         accelerator.unwrap_model(controlnet).save_pretrained(Path(args.output_dir) / "controlnet_structure")
         accelerator.unwrap_model(unet).save_pretrained(Path(args.output_dir) / "unet_lora")
-        print(f"✅ V9.5 态势能量场训练完成。")
+        print(f"✅ V9.7 态势能量场训练完成。")
 
 if __name__ == "__main__":
     main()

@@ -48,7 +48,7 @@ training:
   
   # Logging & Saving
   save_every: 50          
-  output_dir: "./outputs/train_v11_bold_explore_rl/result" # [建议] 改个新名字，方便区分
+  output_dir: "./outputs/train_v11_bold_explore_rl" # [建议] 改个新名字，方便区分
   log_steps: 10
   visualize_every: 5      
 

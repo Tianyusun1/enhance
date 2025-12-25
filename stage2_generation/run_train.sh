@@ -16,7 +16,7 @@ mkdir -p "$HF_HOME"
 # [输出与数据路径]
 # 建议输出目录也更新一下后缀，避免混淆，但我先保留你原有的设置
 OUTPUT_DIR="/home/610-sty/layout2paint3/outputs/taiyi_shanshui_v9_4_fixed"
-DATA_DIR="/home/610-sty/layout2paint3/taiyi_dataset_v8_8_deep_style" 
+DATA_DIR="/home/610-sty/layout2paint3/taiyi_energy_dataset_v9_2" 
 
 # [基础模型路径]
 MODEL_NAME="/home/610-sty/huggingface/Taiyi-Stable-Diffusion-1B-Chinese-v0.1"

@@ -285,7 +285,7 @@ def main():
                 print(f"🌟 [New Best] Avg Reward {avg_reward:.4f} achieved! Model saved to {best_save_path}")
 
             # === [MODIFIED] 保存逻辑 B: 每 10 个 Epoch 保存一次 ===
-            if (epoch + 1) % 50 == 0:
+            if (epoch + 1) % 100 == 0:
                 rl_save_path = os.path.join(train_config['output_dir'], f"rl_finetuned_epoch_{epoch+1}.pth")
                 torch.save({
                     'model_state_dict': model.state_dict(),
