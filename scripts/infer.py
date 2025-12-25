@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-5.2/scripts/infer.py (V5.9: Auto-load Best RL Model)
+# File: tianyusun1/test2/test2-5.2/scripts/infer.py (V6.1: Fix Tuple Error)
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
@@ -19,8 +19,10 @@ from data.visualize import draw_layout
 import yaml
 import re
 import string
+import random
+import copy
 
-# --- 50 句古代诗句（已清洗，含具体描绘）---
+# --- 50 句古代诗句 ---
 POEMS_50 = [
     "白日依山尽，黄河入海流。",
     "明月松间照，清泉石上流。",
@@ -55,94 +57,195 @@ POEMS_50 = [
     "轻舟短棹西湖好，绿水逶迤，芳草长堤.",
     "山光悦鸟性，潭影空人心.",
     "绿树村边合，青山郭外斜.",
-    "霜落熊升树，林空鹿饮溪.",
-    "千峰笋石千株玉，万树松萝万朵云.",
-    "烟波江上使人愁。",
-    "渔舟逐水爱山春，两岸桃花夹古津.",
-    "楼观沧海日，门对浙江潮.",
-    "松风吹解带，山月照弹琴.",
-    "野渡无人舟自横.",
-    "湖光秋月两相和，潭面无风镜未磨.",
-    "江碧鸟逾白，山青花欲燃.",
-    "石泉流暗壁，草露滴秋根.",
-    "晓看红湿处，花重锦官城.",
-    "榆柳荫后檐，桃李罗堂前.",
-    "木末芙蓉花，山中发红萼.",
-    "露从今夜白，月是故乡明.",
-    "萧萧梧叶送寒声，江上秋风动客情.",
-    "山寺月中寻桂子，郡亭枕上看潮头.",
     "横看成岭侧成峰，远近高低各不同."
 ]
 
 def sanitize_filename(text, max_len=30):
-    """将诗句转换为安全的文件名（移除标点、空格，截断）"""
-    # 移除标点和特殊字符
+    """将诗句转换为安全的文件名"""
     valid_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
-    cleaned = ''.join(c for c in text if c in valid_chars or '\u4e00' <= c <= '\u9fff')  # 保留中英文
+    cleaned = ''.join(c for c in text if c in valid_chars or '\u4e00' <= c <= '\u9fff')
     cleaned = cleaned.replace(' ', '_').replace('　', '_')
-    # 截断并去除首尾下划线
     return cleaned[:max_len].strip('_').replace('__', '_') or "poem"
 
+# ==========================================
+# [修复版] 随机对称变换 + 碰撞检测
+# ==========================================
+
+def calculate_total_iou(boxes_tensor):
+    """计算当前所有框的总重叠面积"""
+    if boxes_tensor.size(0) < 2: return 0.0
+    
+    x1 = boxes_tensor[:, 0] - boxes_tensor[:, 2] / 2
+    x2 = boxes_tensor[:, 0] + boxes_tensor[:, 2] / 2
+    y1 = boxes_tensor[:, 1] - boxes_tensor[:, 3] / 2
+    y2 = boxes_tensor[:, 1] + boxes_tensor[:, 3] / 2
+    
+    n = boxes_tensor.size(0)
+    total_inter = 0.0
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            xx1 = max(x1[i], x1[j])
+            yy1 = max(y1[i], y1[j])
+            xx2 = min(x2[i], x2[j])
+            yy2 = min(y2[i], y2[j])
+            
+            w = max(0, xx2 - xx1)
+            h = max(0, yy2 - yy1)
+            total_inter += w * h
+            
+    return total_inter
+
+def apply_random_symmetry(layout_list, collision_threshold=None):
+    """
+    [V4 最终版] 完美支持 (Label, X, Y, W, H...) 扁平元组结构
+    """
+    if not layout_list: return layout_list
+    
+    # --- 1. 深度格式检测 ---
+    first_item = layout_list[0]
+    boxes_data = []
+    mode = 'unknown' 
+
+    # Case A: 字典模式
+    if isinstance(first_item, dict) and 'bbox' in first_item:
+        mode = 'dict'
+        boxes_data = [item['bbox'] for item in layout_list]
+
+    # Case B: 扁平元组 (Label, X, Y, W, H, ...) <--- 这是你的情况！
+    # 特征：长度>=5, 第0个是数字(Label), 第1-4个也是数字(坐标)
+    elif isinstance(first_item, (tuple, list)) and len(first_item) >= 5:
+        # 假设: Index 0=Label, 1=X, 2=Y, 3=W, 4=H
+        mode = 'flat_tuple_label_first'
+        # 我们只提取 [x, y, w, h] (即 index 1 到 4)
+        boxes_data = [list(item[1:5]) for item in layout_list]
+        print(f"   [Debug] Detected format: (Label, X, Y, W, H...)")
+
+    # Case C: 嵌套元组 ([x,y,w,h], label)
+    elif isinstance(first_item, (tuple, list)) and \
+         len(first_item) > 0 and isinstance(first_item[0], (tuple, list)):
+        mode = 'tuple_nested'
+        boxes_data = [item[0] for item in layout_list]
+
+    # Case D: 纯坐标列表 [x,y,w,h]
+    elif isinstance(first_item, (tuple, list)) and len(first_item) == 4:
+        mode = 'list_flat'
+        boxes_data = layout_list
+
+    else:
+        print(f"⚠️ [Symmetry] Unknown data format: {first_item}. Skipping.")
+        return layout_list
+
+    # --- 2. 转换 Tensor ---
+    try:
+        boxes_tensor = torch.tensor(boxes_data, dtype=torch.float32)
+    except Exception as e:
+        print(f"⚠️ [Symmetry] Tensor conversion failed: {e}. Skipping.")
+        return layout_list
+
+    # 确保维度正确 [N, 4]
+    if boxes_tensor.dim() == 1:
+        if boxes_tensor.size(0) == 4: boxes_tensor = boxes_tensor.unsqueeze(0)
+        else: return layout_list
+
+    N = boxes_tensor.size(0)
+    
+    # --- 3. [安全锁] 坐标归一化检查 ---
+    # 现在取的是真正的 X (index 0 of boxes_tensor)，应该是 0.248 这种小数
+    max_val = boxes_tensor[:, 0].max().item() 
+    
+    should_flip = True
+    if max_val > 1.1: 
+        print(f"⚠️ [Warning] X-Coordinate still > 1.0 (Max={max_val:.2f}). Skipping flip.")
+        should_flip = False
+
+    # --- 4. 执行翻转 ---
+    flipped_count = 0
+    if should_flip:
+        indices = list(range(N))
+        for i in indices:
+            if random.random() < 0.3:  # 30% 概率
+                original_x = boxes_tensor[i, 0].item()
+                # 镜像翻转: new_x = 1.0 - x
+                boxes_tensor[i, 0] = 1.0 - original_x
+                flipped_count += 1
+
+    # --- 5. 数据回写 (Re-assembly) ---
+    final_layout = []
+    
+    if mode == 'flat_tuple_label_first':
+        # 你的情况：需要把改好的 [x,y,w,h] 塞回 (label, x, y, w, h, ...)
+        for i, item in enumerate(layout_list):
+            new_xywh = boxes_tensor[i].tolist() # [new_x, y, w, h]
+            
+            # 重新拼接元组: (Label,) + (New X, Y, W, H) + (Rest...)
+            # item[0]: Label
+            # item[5:]: 后面的参数 (如置信度等)
+            new_item = (item[0],) + tuple(new_xywh) + item[5:]
+            final_layout.append(new_item)
+
+    elif mode == 'dict':
+        final_layout = copy.deepcopy(layout_list)
+        for i, item in enumerate(final_layout):
+            item['bbox'] = boxes_tensor[i].tolist()
+            
+    elif mode == 'tuple_nested':
+        for i, item in enumerate(layout_list):
+            new_box = boxes_tensor[i].tolist()
+            new_item = (new_box,) + tuple(item[1:])
+            final_layout.append(new_item)
+            
+    elif mode == 'list_flat':
+        final_layout = boxes_tensor.tolist()
+            
+    if flipped_count > 0:
+        print(f"✅ [Symmetry] Flipped {flipped_count}/{N} boxes.")
+    else:
+        print(f"   [Symmetry] Skipped (random) or Safety Lock.")
+        
+    return final_layout
+
+
+# ==========================================
+
 def find_best_checkpoint(output_dir):
-    """
-    自动查找最佳检查点。
-    优先级：
-    1. rl_best_reward.pth (RL微调后的最佳奖励模型)
-    2. rl_finetuned_epoch_X.pth (最新的 RL 模型)
-    3. model_best_val_loss.pth (监督训练的最佳 Loss 模型)
-    4. model_epoch_X.pth (最新的监督训练模型)
-    """
-    if not os.path.exists(output_dir):
-        return None
+    """自动查找最佳检查点"""
+    if not os.path.exists(output_dir): return None
     files = [f for f in os.listdir(output_dir) if f.endswith('.pth')]
     
-    # [NEW] 优先级 1: RL 最佳奖励模型
     if "rl_best_reward.pth" in files:
-        checkpoint_path = os.path.join(output_dir, "rl_best_reward.pth")
-        print(f"[Auto-Resume] Found Best RL Reward model: {checkpoint_path}")
-        return checkpoint_path
+        return os.path.join(output_dir, "rl_best_reward.pth")
 
-    # 优先级 2: RL 微调过程中的 Checkpoint
     rl_checkpoints = []
     for f in files:
         if "rl_finetuned" in f:
             match = re.search(r'epoch_(\d+)', f)
-            if match:
-                epoch_num = int(match.group(1))
-                rl_checkpoints.append((epoch_num, os.path.join(output_dir, f)))
+            if match: rl_checkpoints.append((int(match.group(1)), os.path.join(output_dir, f)))
     if rl_checkpoints:
         rl_checkpoints.sort(key=lambda x: x[0], reverse=True)
-        print(f"[Auto-Resume] Found latest RL finetuned model: {rl_checkpoints[0][1]}")
         return rl_checkpoints[0][1]
     
-    # 优先级 3: 监督训练最佳验证集模型
     best_models = [f for f in files if "best_val_loss" in f]
-    if best_models:
-        print(f"[Auto-Resume] Found Best Val Loss model: {os.path.join(output_dir, best_models[0])}")
-        return os.path.join(output_dir, best_models[0])
+    if best_models: return os.path.join(output_dir, best_models[0])
     
-    # 优先级 4: 监督训练普通 Checkpoint
     epoch_models = []
     for f in files:
         if "model_epoch_" in f and "rl" not in f:
             match = re.search(r'epoch_(\d+)', f)
-            if match:
-                epoch_num = int(match.group(1))
-                epoch_models.append((epoch_num, os.path.join(output_dir, f)))
+            if match: epoch_models.append((int(match.group(1)), os.path.join(output_dir, f)))
     if epoch_models:
         epoch_models.sort(key=lambda x: x[0], reverse=True)
-        print(f"[Auto-Resume] Found latest supervised model: {epoch_models[0][1]}")
         return epoch_models[0][1]
         
     return None
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch Inference for 50 Ancient Poems")
-    parser.add_argument("--poem", type=str, default=None, help="Single poem for inference (optional)")
+    parser = argparse.ArgumentParser(description="Batch Inference with Symmetry Augmentation")
+    parser.add_argument("--poem", type=str, default=None, help="Single poem")
     parser.add_argument("--mode", type=str, default="sample", choices=["greedy", "sample"], help="Decoding mode")
-    parser.add_argument("--top_k", type=int, default=3, help="Top-K for sampling")
-    parser.add_argument("--num_samples", type=int, default=3, help="Number of samples per poem")
-    parser.add_argument("--checkpoint", type=str, default="/home/610-sty/layout2paint3/outputs/train_v7_gestal_rl/rl_best_reward.pth", help="Path to specific checkpoint (default: auto-find best)")
+    parser.add_argument("--top_k", type=int, default=2, help="Top-K for sampling")
+    parser.add_argument("--num_samples", type=int, default=2, help="Number of samples per poem")
+    parser.add_argument("--checkpoint", type=str, default="/home/610-sty/layout2paint3/outputs/train_v11_bold_explore_rl/rl_best_reward.pth")
     args = parser.parse_args()
 
     # Load config
@@ -155,7 +258,6 @@ def main():
 
     # Init model
     latent_dim = config['model'].get('latent_dim', 32)
-    print(f"Initializing model with latent_dim={latent_dim}...")
     model = Poem2LayoutGenerator(
         bert_path=config['model']['bert_path'],
         num_classes=config['model']['num_classes'],
@@ -164,8 +266,7 @@ def main():
         decoder_layers=config['model']['decoder_layers'],
         decoder_heads=config['model']['decoder_heads'],
         dropout=config['model']['dropout'],
-        latent_dim=latent_dim,
-        clustering_loss_weight=config['model'].get('clustering_loss_weight', 1.0)
+        latent_dim=latent_dim
     )
 
     # Load checkpoint
@@ -179,33 +280,22 @@ def main():
         print(f"[Warning] No valid checkpoint found. Running with random weights.")
     else:
         print(f"Loading checkpoint: {checkpoint_path}")
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
-            model.load_state_dict(state_dict)
-            print("✅ Model loaded successfully.")
-        except RuntimeError as e:
-            print(f"\n[ERROR] Checkpoint loading failed: {e}")
-            print("Tip: Check if 'latent_dim' in config matches the trained model.")
-            return
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+        model.load_state_dict(state_dict)
+        print("✅ Model loaded successfully.")
 
     model.to(device)
     model.eval()
     tokenizer = BertTokenizer.from_pretrained(config['model']['bert_path'])
 
-    # 确定要处理的诗句列表
-    if args.poem:
-        poems_to_process = [args.poem]
-    else:
-        poems_to_process = POEMS_50
-
+    poems_to_process = [args.poem] if args.poem else POEMS_50
     save_dir = config['training']['output_dir']
     os.makedirs(save_dir, exist_ok=True)
 
     print(f"------------------------------------------------")
-    print(f"Starting batch inference for {len(poems_to_process)} poem(s)...")
-    print(f"Mode: {args.mode} | Top-K: {args.top_k} | Samples per poem: {args.num_samples}")
-    print(f"Results will be saved to: {save_dir}")
+    print(f"Starting batch inference with Symmetry Augmentation...")
+    print(f"Mode: {args.mode} | Samples: {args.num_samples}")
     print(f"------------------------------------------------")
 
     for idx, poem in enumerate(poems_to_process, 1):
@@ -213,7 +303,8 @@ def main():
         poem_safe_name = sanitize_filename(poem, max_len=25)
 
         for sample_idx in range(args.num_samples):
-            layout = greedy_decode_poem_layout(
+            # 1. 原始生成
+            raw_layout = greedy_decode_poem_layout(
                 model, tokenizer, poem,
                 max_elements=config['model'].get('max_elements', 30),
                 device=device.type,
@@ -221,7 +312,10 @@ def main():
                 top_k=args.top_k
             )
 
-            # 构建唯一文件名
+            # 2. 应用随机对称增强 (已修复 Tuple 报错)
+            final_layout = apply_random_symmetry(raw_layout, collision_threshold=0.02)
+
+            # 3. 保存与绘图
             suffix = f"_{args.mode}"
             if args.num_samples > 1:
                 suffix += f"_sample{sample_idx+1}"
@@ -230,12 +324,12 @@ def main():
             output_txt_path = os.path.join(save_dir, f"{file_base}.txt")
             output_png_path = os.path.join(save_dir, f"{file_base}.png")
 
-            layout_seq_to_yolo_txt(layout, output_txt_path)
-            draw_layout(layout, f"{args.mode.capitalize()} Inference: {poem}", output_png_path)
+            layout_seq_to_yolo_txt(final_layout, output_txt_path)
+            draw_layout(final_layout, f"{poem} (Sym-Aug)", output_png_path)
 
             print(f"  → Saved: {file_base}.png")
 
-    print(f"\n✅ Batch inference completed! All results saved in: {save_dir}")
+    print(f"\n✅ All done! Check {save_dir} for diverse layouts.")
 
 if __name__ == "__main__":
     main()

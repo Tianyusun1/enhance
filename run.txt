@@ -9,7 +9,7 @@ python scripts/train.py
 # 示例路径：outputs/model_best_val_loss_1.234.pth
 python scripts/train.py \
     --rl_tuning \
-    --checkpoint /home/610-sty/layout2paint3/outputs/train_v7_gestal_rl/model_epoch_50.pth
+    --checkpoint /home/610-sty/layout2paint3/outputs/train_v11_bold_explore/model_best_val_loss_2.0302.pth
 # 输出：最终的 RL 优化模型，例如 rl_best_reward.pth。
 
 #处理数据！
