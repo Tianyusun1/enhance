@@ -1,4 +1,4 @@
-# File: stage2_generation/scripts/train_taiyi.py (V9.7: Validation Sampling Fix & Gestalt Energy)
+# File: stage2_generation/scripts/train_taiyi.py (V13.0: Min-SNR & Semantic Precision)
 
 import argparse
 import logging
@@ -11,7 +11,7 @@ import sys
 import matplotlib.pyplot as plt
 
 # =========================================================
-# [CRITICAL PATCH] 修复受限环境下的 PermissionError (完整保留)
+# [PATCH] 修复受限环境下的 PermissionError (完整保留)
 # =========================================================
 try:
     EnvironClass = os.environ.__class__
@@ -72,47 +72,24 @@ from peft import LoraConfig, get_peft_model
 
 logger = get_logger(__name__)
 
-# =========================================================
-# [NEW V9.5] 自定义 Attention 处理器用于能量场注入训练
-# =========================================================
-class GestaltEnergyAttnProcessor:
-    """
-    训练时干预 Attention Map 的计算，注入高斯能量场监督。
-    """
-    def __init__(self, energy_masks, scale=5.0):
-        self.energy_masks = energy_masks # [Batch, Seq_Len, 64, 64]
-        self.scale = scale
-
-    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, **kwargs):
-        batch_size, sequence_length, _ = hidden_states.shape
-        query = attn.to_q(hidden_states)
-        encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
-        key = attn.to_k(encoder_hidden_states)
-        value = attn.to_v(encoder_hidden_states)
-
-        query = attn.head_to_batch_dim(query)
-        key = attn.head_to_batch_dim(key)
-        value = attn.head_to_batch_dim(value)
-
-        attention_probs = attn.get_attention_scores(query, key, attention_mask)
-
-        # 在训练时应用能量场增强，让模型学会对齐这种平滑信号
-        # 我们只在 64x64 分辨率的层（通常是 mid_block 或 up_blocks 的深层）进行注入
-        if self.energy_masks is not None and attention_probs.shape[1] == 4096:
-            # energy_masks: [B, Max_Tokens, 4096]
-            # 简化逻辑：对齐注意力概率
-            pass # 注意：训练时我们更多通过 Loss 约束，此处 processor 保持结构以供推理对齐
-
-        hidden_states = torch.bmm(attention_probs, value)
-        hidden_states = attn.batch_to_head_dim(hidden_states)
-        hidden_states = attn.to_out[0](hidden_states)
-        hidden_states = attn.to_out[1](hidden_states)
-        return hidden_states
+# [NEW] Min-SNR Loss 计算辅助函数
+# 作用: 解决多物体复杂场景下的"训练不收敛"和"细节糊"的问题
+def compute_snr(timesteps, noise_scheduler):
+    alphas_cumprod = noise_scheduler.alphas_cumprod
+    sqrt_alphas_cumprod = alphas_cumprod ** 0.5
+    sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod) ** 0.5
+    
+    # 扩展 alpha 到 timestep 维度
+    sqrt_alphas_cumprod = sqrt_alphas_cumprod.to(device=timesteps.device)[timesteps].float()
+    sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod.to(device=timesteps.device)[timesteps].float()
+    
+    snr = (sqrt_alphas_cumprod / sqrt_one_minus_alphas_cumprod) ** 2
+    return snr
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained_model_name_or_path", type=str, default="Idea-CCNL/Taiyi-Stable-Diffusion-1B-Chinese-v0.1")
-    parser.add_argument("--output_dir", type=str, default="taiyi_shanshui_v9_5_energy")
+    parser.add_argument("--output_dir", type=str, default="taiyi_shanshui_v13_snr")
     parser.add_argument("--train_data_dir", type=str, required=True)
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--train_batch_size", type=int, default=4) 
@@ -122,14 +99,24 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--mixed_precision", type=str, default="fp16") 
     parser.add_argument("--checkpointing_steps", type=int, default=2000)
-    parser.add_argument("--lambda_struct", type=float, default=0.5, help="ControlNet特征对齐权重")
-    # [NEW V9.5] 能量场对齐权重
-    parser.add_argument("--lambda_energy", type=float, default=1.0, help="Cross-Attention能量场对齐权重")
+    
+    # 彻底禁用产生伪影的损失
+    parser.add_argument("--lambda_struct", type=float, default=0.0)
+    parser.add_argument("--lambda_energy", type=float, default=0.0)
     
     parser.add_argument("--lora_rank", type=int, default=32)
     parser.add_argument("--lora_alpha_ratio", type=float, default=1.0)
-    parser.add_argument("--smart_freeze", action="store_true", default=True)
     
+    # [关键设置] 默认False (全量解冻)
+    # 你的Mask有颜色语义(红山蓝水)，必须全量训练才能让模型学会"看颜色辨物体"
+    parser.add_argument("--smart_freeze", action="store_true", default=False)
+    
+    # [NEW] Min-SNR Gamma
+    parser.add_argument("--snr_gamma", type=float, default=5.0, help="Min-SNR 权重，建议 5.0")
+    
+    # Offset Noise
+    parser.add_argument("--offset_noise_scale", type=float, default=0.1)
+
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -141,7 +128,7 @@ def main():
 
     if accelerator.is_main_process:
         logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
-        logger.info(f"🚀 V9.7 启动: 验证采样修复版 | 态势能量场对齐 | Energy权重: {args.lambda_energy}")
+        logger.info(f"🚀 V13.0 启动: 语义精准版 | BERT修复 | Min-SNR={args.snr_gamma} | 全量解冻")
 
     # 1. 加载模型
     tokenizer = transformers.BertTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
@@ -162,11 +149,16 @@ def main():
     )
     unet = get_peft_model(unet, unet_lora_config)
     
+    # [关键逻辑] 你的布局有颜色语义，必须全量训练 ControlNet
     if args.smart_freeze:
+        if accelerator.is_main_process: logger.info("❄️ 警告: Smart Freeze 已开启，可能会丢失颜色语义！")
         controlnet.requires_grad_(False) 
         for n, p in controlnet.named_parameters():
             if any(k in n for k in ["controlnet_cond_embedding", "conv_in", "controlnet_down_blocks", "controlnet_mid_block"]):
                 p.requires_grad = True
+    else:
+        if accelerator.is_main_process: logger.info("🔥 状态: ControlNet 全量解冻 - 学习语义布局映射")
+        controlnet.requires_grad_(True)
 
     params_to_optimize = [
         {"params": filter(lambda p: p.requires_grad, controlnet.parameters()), "lr": args.learning_rate},
@@ -174,7 +166,7 @@ def main():
     ]
     optimizer = torch.optim.AdamW(params_to_optimize)
 
-    # 4. 数据加载 (V9.5 适配 layout_energy)
+    # 4. 数据加载
     raw_dataset = load_dataset("json", data_files=os.path.join(args.train_data_dir, "train.jsonl"))["train"]
     train_dataset = raw_dataset.train_test_split(test_size=0.05, seed=42)['train']
 
@@ -188,8 +180,14 @@ def main():
         transforms.ToTensor(), 
     ])
 
+    # [BERT Fix] 预计算空 Prompt IDs/Mask
+    null_prompt = tokenizer("", max_length=tokenizer.model_max_length, 
+                            padding="max_length", truncation=True, return_tensors="pt")
+    null_prompt_ids = null_prompt.input_ids[0]
+    null_prompt_mask = null_prompt.attention_mask[0] # <--- 必须有
+
     def collate_fn(examples):
-        pixel_values, cond_pixel_values, input_ids, energy_masks = [], [], [], []
+        pixel_values, cond_pixel_values, input_ids, attention_masks = [], [], [], []
         texts = []
         for example in examples:
             try:
@@ -198,41 +196,23 @@ def main():
                 pixel_values.append(transform(Image.open(img_path).convert("RGB")))
                 cond_pixel_values.append(cond_transform(Image.open(cond_path).convert("RGB")))
                 
-                # 处理 Prompt 和 Token
                 caption = example["text"]
                 texts.append(caption)
                 inputs = tokenizer(caption, max_length=tokenizer.model_max_length, 
                                  padding="max_length", truncation=True, return_tensors="pt")
                 input_ids.append(inputs.input_ids[0])
+                # [关键] 收集 Attention Mask，让 BERT 听懂你的指挥
+                attention_masks.append(inputs.attention_mask[0])
                 
-                # [V9.5] 处理高斯能量场 (将 list 转为 tensor)
-                # 构造一个 [Max_Tokens, 4096] 的张量
-                full_energy = torch.zeros((tokenizer.model_max_length, 4096))
-                tokens = tokenizer.encode(caption)
-                
-                class_to_keyword = {2: "山", 3: "水", 4: "人", 5: "树", 6: "屋", 7: "桥", 8: "花", 9: "鸟", 10: "兽"}
-                
-                if "layout_energy" in example:
-                    for obj in example["layout_energy"]:
-                        cid = obj["class_id"]
-                        kw = class_to_keyword.get(cid)
-                        if not kw: continue
-                        
-                        kw_ids = tokenizer.encode(kw, add_special_tokens=False)
-                        mask_data = torch.tensor(obj["mask_data"]).flatten() # [4096]
-                        
-                        for i, tid in enumerate(tokens):
-                            if tid in kw_ids and i < tokenizer.model_max_length:
-                                full_energy[i] = torch.max(full_energy[i], mask_data)
-                
-                energy_masks.append(full_energy)
             except Exception as e: continue
             
+        if len(pixel_values) == 0: return None
+
         return {
             "pixel_values": torch.stack(pixel_values),
             "conditioning_pixel_values": torch.stack(cond_pixel_values),
             "input_ids": torch.stack(input_ids),
-            "energy_masks": torch.stack(energy_masks),
+            "attention_masks": torch.stack(attention_masks),
             "texts": texts
         }
 
@@ -243,37 +223,39 @@ def main():
     text_encoder.to(device, dtype=torch.float16)
     scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
-    loss_history = {'steps': [], 'total': [], 'mse': [], 'energy': []}
-
     # 5. 训练循环
     global_step = 0
     for epoch in range(args.num_train_epochs):
         controlnet.train(); unet.train()
         for step, batch in enumerate(train_dataloader):
+            if batch is None: continue 
+
             with accelerator.accumulate(controlnet, unet):
-                # 准备 Latents
                 latents = vae.encode(batch["pixel_values"].to(dtype=torch.float16)).latent_dist.sample() * vae.config.scaling_factor
+                
+                # [Offset Noise]
                 noise = torch.randn_like(latents)
+                if args.offset_noise_scale > 0:
+                    noise += args.offset_noise_scale * torch.randn(latents.shape[0], latents.shape[1], 1, 1, device=latents.device)
+                
                 timesteps = torch.randint(0, 1000, (latents.shape[0],), device=latents.device).long()
                 noisy_latents = scheduler.add_noise(latents, noise, timesteps)
                 
-                # Double Dropout 策略
+                # CFG 策略
                 rand_dropout = random.random()
-                cond_image = batch["conditioning_pixel_values"].to(dtype=torch.float16)
-                if rand_dropout < 0.15: 
-                    cond_input = torch.zeros_like(cond_image)
-                    current_ids = batch["input_ids"]
-                elif rand_dropout < 0.30:
-                    cond_input = cond_image
-                    current_ids = torch.full_like(batch["input_ids"], tokenizer.pad_token_id)
+                cond_input = batch["conditioning_pixel_values"].to(dtype=torch.float16)
+                
+                if rand_dropout < 0.1: 
+                    current_ids = null_prompt_ids.repeat(len(batch["input_ids"]), 1).to(device)
+                    current_mask = null_prompt_mask.repeat(len(batch["input_ids"]), 1).to(device)
                 else:
-                    cond_input = cond_image
                     current_ids = batch["input_ids"]
+                    current_mask = batch["attention_masks"]
 
-                encoder_hidden_states = text_encoder(current_ids)[0]
+                # [BERT Fix] 传入 mask
+                encoder_hidden_states = text_encoder(current_ids, attention_mask=current_mask)[0]
                 
-                # [V9.5 核心逻辑] 提取 Cross-Attention Map 进行能量场对齐
-                
+                # Forward
                 down_res, mid_res = controlnet(noisy_latents, timesteps, encoder_hidden_states, cond_input, return_dict=False)
                 
                 model_pred = unet(
@@ -282,33 +264,32 @@ def main():
                     mid_block_additional_residual=mid_res.to(dtype=torch.float16)
                 ).sample
 
-                # A. 基础去噪损失 (已经 Cast 成 float 计算)
-                loss_mse = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+                # ==========================================
+                # [NEW] Min-SNR Loss (解决多物体糊、杂乱的核心)
+                # ==========================================
+                if args.snr_gamma == 0:
+                    loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
+                else:
+                    # 计算信噪比
+                    snr = compute_snr(timesteps, scheduler)
+                    mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(snr)], dim=1).min(dim=1)[0]
+                    if scheduler.config.prediction_type == "epsilon":
+                        mse_loss_weights = mse_loss_weights / snr
+                    elif scheduler.config.prediction_type == "v_prediction":
+                        mse_loss_weights = mse_loss_weights / (snr + 1)
+                    
+                    # 加权损失：迫使模型关注高频细节（边缘、纹理），而不是背景
+                    loss = F.mse_loss(model_pred.float(), noise.float(), reduction="none")
+                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+                    loss = loss.mean()
                 
-                # B. 结构特征损失 (ControlNet 对齐)
-                # [FIX V9.6]: 强制转为 float() (FP32) 计算，避免 FP16 Backward Error
-                loss_struct = torch.tensor(0.0).to(device)
-                if rand_dropout >= 0.15:
-                    cond_feat = F.interpolate(cond_input, size=mid_res.shape[-2:], mode="bilinear")
-                    loss_struct = F.l1_loss(mid_res.float().mean(dim=1, keepdim=True), cond_feat.float().mean(dim=1, keepdim=True))
-
-                # C. [NEW] 能量场损失：确保 UNet 注意力分布与高斯场一致
-                # [FIX V9.6]: 强制转为 float() (FP32) 计算
-                loss_energy = torch.tensor(0.0).to(device)
-                if args.lambda_energy > 0 and rand_dropout >= 0.15:
-                    energy_gt = F.interpolate(batch["energy_masks"].sum(dim=1).view(-1, 1, 64, 64), size=mid_res.shape[-2:])
-                    loss_energy = F.mse_loss(mid_res.float().mean(dim=1, keepdim=True), energy_gt.float())
-
-                total_loss = loss_mse + args.lambda_struct * loss_struct + args.lambda_energy * loss_energy
-                
-                accelerator.backward(total_loss)
+                accelerator.backward(loss)
                 optimizer.step()
                 optimizer.zero_grad()
             
             global_step += 1
             if step % 10 == 0 and accelerator.is_main_process:
-                loss_history['total'].append(total_loss.item()); loss_history['energy'].append(loss_energy.item())
-                print(f"Epoch {epoch+1} | Step {step} | Loss: {total_loss.item():.4f} | Energy: {loss_energy.item():.4f}")
+                print(f"Epoch {epoch+1} | Step {step} | Loss: {loss.item():.4f} | Min-SNR: {args.snr_gamma}")
 
             if global_step % args.checkpointing_steps == 0 and accelerator.is_main_process:
                 ckpt_dir = Path(args.output_dir) / f"checkpoint-{global_step}"
@@ -316,30 +297,41 @@ def main():
                 accelerator.unwrap_model(controlnet).save_pretrained(ckpt_dir / "controlnet_structure") 
                 accelerator.unwrap_model(unet).save_pretrained(ckpt_dir / "unet_lora")
 
-        # [V9.7 FIX] 验证采样逻辑：增加 autocast 以解决 FP32 UNet 与 FP16 VAE 的冲突
+        # 验证逻辑
         if accelerator.is_main_process:
             controlnet.eval(); unet.eval()
             try:
-                # 使用 autocast 自动处理 float/half 类型匹配
                 with torch.no_grad(), torch.autocast("cuda"):
                     pipe = StableDiffusionControlNetPipeline(
                         vae=vae, text_encoder=text_encoder, tokenizer=tokenizer,
                         unet=accelerator.unwrap_model(unet), controlnet=accelerator.unwrap_model(controlnet),
                         scheduler=scheduler, safety_checker=None, feature_extractor=None
                     ).to(device)
-                    val_neg = "真实照片，摄影感，3D渲染，锐利边缘，现代感，鲜艳色彩，油画，水粉画"
-                    test_batch = next(iter(train_dataloader)) 
-                    # image 输入保持 FP16 即可，autocast 会处理 ControlNet(FP32) 的输入
-                    sample_img = pipe(prompt=test_batch["texts"][0], negative_prompt=val_neg, 
-                                    image=test_batch["conditioning_pixel_values"][0:1].to(device, dtype=torch.float16)).images[0]
+                    pipe.set_progress_bar_config(disable=True)
+                    
+                    val_neg = "真实照片，摄影感，3D渲染，锐利边缘，现代感，鲜艳色彩，油画，水粉画，杂乱，模糊，重影"
+                    test_sample = train_dataset[0]
+                    
+                    val_img_path = os.path.join(args.train_data_dir, test_sample["conditioning_image"])
+                    val_cond_img = Image.open(val_img_path).convert("RGB").resize((args.resolution, args.resolution))
+                    val_cond_tensor = cond_transform(val_cond_img).unsqueeze(0).to(device, dtype=torch.float16)
+                    
+                    sample_img = pipe(
+                        prompt=test_sample["text"], 
+                        negative_prompt=val_neg, 
+                        image=val_cond_tensor
+                    ).images[0]
+                    
                     sample_img.save(Path(args.output_dir) / f"val_epoch_{epoch+1}.png")
+                    print(f"📷 Epoch {epoch+1} 验证图已保存。")
                     del pipe; torch.cuda.empty_cache()
-            except Exception as e: print(f"采样失败: {e}")
+            except Exception as e: 
+                print(f"⚠️ 采样失败: {e}")
 
     if accelerator.is_main_process:
         accelerator.unwrap_model(controlnet).save_pretrained(Path(args.output_dir) / "controlnet_structure")
         accelerator.unwrap_model(unet).save_pretrained(Path(args.output_dir) / "unet_lora")
-        print(f"✅ V9.7 态势能量场训练完成。")
+        print(f"✅ V13.0 训练完成 (Min-SNR & Semantic Precision)。")
 
 if __name__ == "__main__":
     main()
