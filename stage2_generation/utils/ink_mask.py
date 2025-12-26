@@ -1,21 +1,21 @@
-# File: stage2_generation/utils/ink_mask.py (V9.9: Artifacts Fixed & Smooth Edge)
+# File: stage2_generation/utils/ink_mask.py (V10.0: Organic Ink & Physics Texture)
 
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter
 import torch
 from typing import List, Union
 import math
+import random
 import cv2 
 
 class InkWashMaskGenerator:
     """
-    [V9.9 修复版] 纹理化势能场生成器
+    [V10.0 终极融合版] 有机墨迹生成器
     
-    修复记录:
-    1. 收紧高斯核 (Divisor 2.5 -> 4.2)，防止墨迹填满整个框导致边缘生硬。
-    2. 引入边缘破碎逻辑 (Edge Breakup)，消除人工合成的“方框感”。
-    3. 优化枯笔纹理混合算法，防止画面出现黑色噪点空洞。
-    4. 增加最小尺寸限制，防止小物体消失。
+    核心特性:
+    1. Polygon Distortion: 将矩形框转化为不规则多边形，彻底消除人工方框感。
+    2. Distance Gradient: 利用距离变换模拟墨水从中心向边缘的自然衰减。
+    3. Physics Texture: 保留 V9.9 的枯湿笔触物理模拟。
     """
     
     CLASS_COLORS = {
@@ -33,145 +33,168 @@ class InkWashMaskGenerator:
     def __init__(self, width=512, height=512):
         self.width = width
         self.height = height
-        # 预计算网格
-        x = np.arange(0, width, 1, float)
-        y = np.arange(0, height, 1, float)
-        self.y_grid, self.x_grid = np.meshgrid(y, x, indexing='ij')
         
-    def _generate_rotated_gaussian(self, box: np.ndarray) -> np.ndarray:
-        class_id = int(box[0])
-        cx, cy, w, h = box[1], box[2], box[3], box[4]
-        
-        # 提取 V8 态势参数
-        if len(box) >= 9:
-            bx, by = box[5], box[6]
-            rot = box[7]
-            flow = box[8] # [-1, 1] 枯湿程度
-        else:
-            bx, by, rot, flow = 0.0, 0.0, 0.0, 0.0
+    def _rotate_point(self, px, py, cx, cy, angle):
+        """绕中心点旋转坐标"""
+        theta = angle * math.pi / 2.0  # 假设 angle 是 [0,1] 对应 90度，或者根据你的定义调整
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        nx = cos_t * (px - cx) - sin_t * (py - cy) + cx
+        ny = sin_t * (px - cx) + cos_t * (py - cy) + cy
+        return nx, ny
 
-        # 1. 基础几何计算
-        center_x = (cx + bx * 0.15) * self.width
-        center_y = (cy + by * 0.15) * self.height
+    def _distort_box(self, x, y, w, h, rot=0.0, roughness=0.2):
+        """
+        生成不规则多边形顶点，模拟手绘/墨迹边缘
+        """
+        points = []
+        segments = 8  # 每条边的细分段数
         
-        # [Fix 1] 收紧核心: 从 2.5 改为 4.2
-        # 让高斯分布集中在框的中心，确保边缘处数值自然衰减到 0
-        flow_scale = 1.0 + flow * 0.3 
-        sigma_x = (w * self.width / 4.2) * flow_scale
-        sigma_y = (h * self.height / 4.2) * flow_scale
+        # 矩形四个角点 (未旋转)
+        cx, cy = x + w/2, y + h/2
+        tl, tr = (x, y), (x + w, y)
+        br, bl = (x + w, y + h), (x, y + h)
         
-        theta = rot * (math.pi / 2.0)
-        cos_t = np.cos(theta)
-        sin_t = np.sin(theta)
-        
-        dx = self.x_grid - center_x
-        dy = self.y_grid - center_y
-        dx_rot = dx * cos_t + dy * sin_t
-        dy_rot = -dx * sin_t + dy * cos_t
-        
-        exponent = - (dx_rot**2 / (2 * sigma_x**2 + 1e-6) + 
-                      dy_rot**2 / (2 * sigma_y**2 + 1e-6))
-        
-        # 基础场 (0~1)
-        field = np.exp(np.clip(exponent, -20, 0))
-        
-        # [Fix 2] 消除“方框”伪影 (The Box Artifact Killer)
-        # 策略：线性移位 + 边缘随机打碎
-        
-        # A. 线性移位：切掉底部的 15% 拖尾，让边缘更干脆，但保持内部平滑
-        field = np.maximum(0, field - 0.15)
-        # 重新归一化，保证中心还是最黑的
-        if field.max() > 0:
-            field = field / field.max()
+        def get_line_points(start, end):
+            res = []
+            vx, vy = end[0] - start[0], end[1] - start[1]
+            length = math.sqrt(vx**2 + vy**2)
+            for i in range(segments):
+                alpha = i / segments
+                # 基础线性插值
+                px = start[0] + vx * alpha
+                py = start[1] + vy * alpha
+                
+                # 垂直方向的随机扰动 (Perpendicular Noise)
+                # 只有中间段抖动大，角点抖动小
+                noise_scale = math.sin(alpha * math.pi) * roughness * max(w, h) * 0.5
+                perp_x, perp_y = -vy, vx
+                # 归一化垂直向量
+                norm = math.sqrt(perp_x**2 + perp_y**2) + 1e-6
+                perp_x /= norm
+                perp_y /= norm
+                
+                noise = (random.random() - 0.5) * 2 * noise_scale
+                px += perp_x * noise
+                py += perp_y * noise
+                
+                # 旋转
+                if rot != 0:
+                    px, py = self._rotate_point(px, py, cx, cy, rot)
+                
+                res.append((px, py))
+            return res
 
-        # B. 边缘破碎 (Edge Breakup)：只在边缘区域(0.01~0.5) 随机扣除像素
-        # 这模拟了宣纸边缘的随机渗透，打破了计算机生成的完美几何感
-        edge_mask = (field > 0.01) & (field < 0.5)
-        if edge_mask.any():
-            edge_noise = np.random.uniform(0.0, 1.0, field.shape)
-            # 约 60% 的概率保留边缘像素，40% 的概率扣掉，制造“毛边”
-            field[edge_mask] *= (edge_noise[edge_mask] > 0.4).astype(np.float32)
-
-        # 2. 纹理注入
-        field = self._apply_texture(field, flow)
+        points.extend(get_line_points(tl, tr))
+        points.extend(get_line_points(tr, br))
+        points.extend(get_line_points(br, bl))
+        points.extend(get_line_points(bl, tl))
         
-        # 3. 上色
-        color = self.CLASS_COLORS.get(class_id, (128, 128, 128))
-        colored_field = np.zeros((self.height, self.width, 3), dtype=np.float32)
-        for i in range(3):
-            colored_field[:, :, i] = field * (color[i] / 255.0)
-            
-        return colored_field
+        return points
 
     def _apply_texture(self, field: np.ndarray, flow: float) -> np.ndarray:
-        """根据 flow 值给高斯场添加水墨纹理"""
-        # 保护：如果场太弱，不处理
+        """
+        [V9.9 保留逻辑] 根据 flow 值给场添加水墨纹理
+        """
         if field.max() < 0.05: return field
 
         noise = np.random.uniform(0, 1, field.shape).astype(np.float32)
         
         if flow < 0: 
             # === 枯笔 (Dry Mode) ===
-            dryness = abs(flow) # 0~1
-            # [Fix 3] 降低阈值，防止画面变成全是噪点
-            # 限制最大阈值，保证物体主体可见
-            threshold = 0.1 + 0.25 * dryness
-            
+            dryness = abs(flow)
+            threshold = 0.1 + 0.3 * dryness
             texture = (noise > threshold).astype(np.float32)
-            
-            # [Fix 4] 使用混合而非直接相乘，保留物体骨架
-            # field = field * texture  <-- OLD (会产生黑色空洞)
-            # NEW: 即使是噪点，也保留 30% 的底色
-            field = field * (0.3 + 0.7 * texture)
-            
-            # 适度锐化，模拟燥锋
-            field = np.power(field, 0.9)
+            # 混合：保留部分底色，防止死黑空洞
+            field = field * (0.4 + 0.6 * texture)
+            field = np.power(field, 0.8) # 略微锐化
             
         else:
             # === 湿笔 (Wet Mode) ===
-            wetness = flow # 0~1
-            k_size = int(5 * wetness) * 2 + 1
+            wetness = flow
+            # 内部高斯模糊，模拟宣纸晕染
+            k_size = int(7 * wetness) * 2 + 1
             if k_size > 1:
                 blurred = cv2.GaussianBlur(field, (k_size, k_size), 0)
-                # 湿笔要更柔和
-                field = 0.4 * field + 0.6 * blurred
+                field = 0.3 * field + 0.7 * blurred
             
-            # 纸张纹理
-            texture = 1.0 - 0.15 * wetness * noise
+            # 纸张纤维纹理
+            texture = 1.0 - 0.2 * wetness * noise
             field = field * texture
 
         return np.clip(field, 0, 1)
 
     def convert_boxes_to_mask(self, boxes: Union[List[List[float]], torch.Tensor]) -> Image.Image:
+        # 画布初始化
         full_canvas = np.zeros((self.height, self.width, 3), dtype=np.float32)
         
         if isinstance(boxes, torch.Tensor):
             boxes = boxes.cpu().numpy()
         
-        # [Fix 5] 增加最小尺寸限制，防止小物体消失
+        # 过滤与排序
         valid_boxes = []
         for b in boxes:
-            if len(b) >= 5 and b[3] > 0 and b[4] > 0:
-                # 强制最小宽度/高度为 5%
-                b[3] = max(b[3], 0.05)
-                b[4] = max(b[4], 0.05)
-                valid_boxes.append(b)
-                
-        # 按面积排序，大的在下
+            if len(b) < 5: continue
+            # 强制最小尺寸，防止物体过小消失
+            b[3] = max(b[3], 0.06) 
+            b[4] = max(b[4], 0.06)
+            valid_boxes.append(b)
+        
+        # 按面积从大到小排序 (背景物体先画)
         sorted_boxes = sorted(valid_boxes, key=lambda b: b[3]*b[4], reverse=True)
             
         for box in sorted_boxes:
             class_id = int(box[0])
-            if class_id < 2 or class_id > 10: continue
+            if class_id not in self.CLASS_COLORS: continue
             
-            object_field = self._generate_rotated_gaussian(box)
+            # 解析参数
+            cx, cy, w, h = box[1], box[2], box[3], box[4]
+            bx, by = (box[5], box[6]) if len(box) >= 7 else (0, 0)
+            rot = box[7] if len(box) >= 8 else 0.0
+            flow = box[8] if len(box) >= 9 else 0.0 # [-1, 1]
             
-            # 积墨融合
-            alpha = np.max(object_field, axis=2, keepdims=True)
-            # 适当增强 Alpha，但不要太强，保留水墨的半透明叠加感
-            alpha = np.clip(alpha * 1.5, 0, 1)
+            # 转换坐标
+            pixel_x = (cx - w/2) * self.width
+            pixel_y = (cy - h/2) * self.height
+            pixel_w = w * self.width
+            pixel_h = h * self.height
             
-            full_canvas = full_canvas * (1 - alpha) + object_field * alpha
+            # 1. 生成不规则多边形 Mask
+            poly_points = self._distort_box(pixel_x, pixel_y, pixel_w, pixel_h, rot, roughness=0.25)
+            
+            # 使用 PIL 绘制单通道 Mask
+            temp_img = Image.new('L', (self.width, self.height), 0)
+            ImageDraw.Draw(temp_img).polygon(poly_points, outline=255, fill=255)
+            mask_np = np.array(temp_img).astype(np.uint8)
+            
+            # 2. 距离变换 (Distance Transform) -> 模拟墨水浓度
+            # 计算每个像素到背景的距离，形成从中心向外衰减的梯度
+            dist_map = cv2.distanceTransform(mask_np, cv2.DIST_L2, 5)
+            max_val = dist_map.max()
+            if max_val > 0:
+                field = dist_map / max_val
+            else:
+                continue
+            
+            # 3. 应用纹理 (枯/湿)
+            field = self._apply_texture(field, flow)
+            
+            # 4. 上色与叠加
+            color = self.CLASS_COLORS[class_id]
+            object_layer = np.zeros_like(full_canvas)
+            for c in range(3):
+                object_layer[:, :, c] = field * (color[c] / 255.0)
+            
+            # Alpha 混合：使用 field 作为 alpha
+            # 增强一点 alpha 让主体更实，边缘更虚
+            alpha = np.clip(field * 1.8, 0, 1)
+            alpha = np.expand_dims(alpha, axis=2)
+            
+            full_canvas = full_canvas * (1 - alpha) + object_layer * alpha
 
-        full_canvas = np.clip(full_canvas * 255.0, 0, 255).astype(np.uint8)
-        return Image.fromarray(full_canvas, mode='RGB')
+        # [Final Polish] 全局高斯模糊
+        # 这一步至关重要，它将所有图层的边缘融合，彻底消除"贴图感"
+        final_img = Image.fromarray(np.clip(full_canvas * 255, 0, 255).astype(np.uint8))
+        final_img = final_img.filter(ImageFilter.GaussianBlur(radius=3))
+        
+        return final_img
