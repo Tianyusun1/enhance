@@ -8,10 +8,10 @@
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # [关键修复] 自动定位项目根目录
-# 1. 获取脚本所在的绝对路径 (例如 .../layout2paint3/stage2_generation)
+# 1. 获取脚本所在的绝对路径
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 
-# 2. 推断项目根目录 (假设脚本在 stage2_generation 下，根目录则是上一级)
+# 2. 推断项目根目录 (假设脚本在 stage2_generation 目录下，根目录则是上一级)
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 # 3. 强制切换工作目录到项目根目录
@@ -22,9 +22,10 @@ echo "📂 工作目录已自动切换至: $(pwd)"
 export HF_HOME="$PROJECT_ROOT/.hf_cache"
 mkdir -p "$HF_HOME"
 
-# [输出与数据路径] (使用绝对路径或基于 PROJECT_ROOT 的路径)
-OUTPUT_DIR="$PROJECT_ROOT/outputs/taiyi_shanshui_v9_9_pure"
+# [输出与数据路径]
+# 注意：确保你已经运行了新的 prepare_data 脚本并生成了无方框的新数据
 DATA_DIR="$PROJECT_ROOT/taiyi_energy_dataset_v9_2" 
+OUTPUT_DIR="$PROJECT_ROOT/outputs/taiyi_shanshui_v14_fixed"
 
 # [基础模型路径]
 MODEL_NAME="/home/610-sty/huggingface/Taiyi-Stable-Diffusion-1B-Chinese-v0.1"
@@ -37,6 +38,7 @@ ACCELERATE_CONFIG="stage2_generation/configs/accelerate_config.yaml"
 # 1. 安全检查
 if [ ! -f "$DATA_DIR/train.jsonl" ]; then
   echo "❌ 错误: 在 $DATA_DIR 中找不到 train.jsonl"
+  echo "👉 请先运行: python stage2_generation/scripts/prepare_data_taiyi.py"
   exit 1
 fi
 
@@ -54,10 +56,10 @@ use_cpu: false
 EOF
 fi
 
-# 3. 启动训练 (V9.9 纯净修复版)
+# 3. 启动训练 (V14.2 终极修复版)
 echo "========================================================"
-echo "🚀 启动 Stage 2 V9.9 训练 (纯净修复版)"
-echo "   策略亮点: 禁用 Struct/Energy Loss (0.0) | 仅使用 MSE | 防止伪影"
+echo "🚀 启动 Stage 2 V14.2 训练 (Clean-Mask & Stable-Joint)"
+echo "   策略: LR平衡(2e-5) | 无模糊增强 | ControlNet全量解冻"
 echo "========================================================"
 
 # 注意：这里的路径是相对于 PROJECT_ROOT 的
@@ -69,11 +71,11 @@ accelerate launch --config_file "$ACCELERATE_CONFIG" --mixed_precision="fp16" st
   --train_batch_size=4 \
   --gradient_accumulation_steps=1 \
   --num_train_epochs=40 \
-  --checkpointing_steps=2000 \
+  --checkpointing_steps=10000 \
   --mixed_precision="fp16" \
   \
   --learning_rate=2e-5 \
-  --learning_rate_lora=1e-4 \
+  --learning_rate_lora=2e-5 \
   \
   --lambda_struct=0.0 \
   --lambda_energy=0.0 \
@@ -81,6 +83,9 @@ accelerate launch --config_file "$ACCELERATE_CONFIG" --mixed_precision="fp16" st
   --lora_rank=32 \
   --lora_alpha_ratio=1.0 \
   \
-  --smart_freeze
+  --snr_gamma=5.0 \
+  --offset_noise_scale=0.1
+
+# 注意：已移除 --smart_freeze，让 ControlNet 全量学习颜色语义
 
 echo "✅ 训练脚本执行完毕。检查验证图: $OUTPUT_DIR"
